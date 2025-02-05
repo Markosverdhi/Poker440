@@ -39,14 +39,3 @@ Finally, within the activated shell in the project directory, run
 
 ### Data Generation
 ### 
-
-
-
-Sharing/Access Information
---------------------------
-
-### Recommended citation for the data:
-
-
-### Related publications:
-<!-- Citation for and links to publications that cite or use the data -->
