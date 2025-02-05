@@ -1,0 +1,5 @@
+TODO
+----------------------------------------
+1. Outsource the data generation in Environment.py into another class, maybe called DataGen or something. The idea is that if we can bulk-generate data in batches, we can create a seed that is associated with a certain sequence of randomly generated hands. This will allow us to test the different algorithms against one-another with the exact same data to see how they react in the exact same circumstances.
+
+2. Implement A3C, DQN and MonteCarlo models. Import Environment.py and the (TODO)DataGen.py into the file. This way, we can keep the implementations separate from one another and try different things out.
