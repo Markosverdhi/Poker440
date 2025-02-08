@@ -1,6 +1,6 @@
-numpy
+numpy==2.2.2
 scipy
 torch==2.6.0
 matplotlib
-gymnasium
-stable-baselilnes3==2.5.0
+gymnasium==
+stable-baselines3==2.5.0
