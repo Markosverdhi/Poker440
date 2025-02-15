@@ -219,13 +219,3 @@ class TexasHoldem6PlayerEnv(gym.Env):
         print("Player Chips:")
         for p in range(self.num_players):
             print(f"  Player {p}: {self.player_chips[p]}")
-
-env = TexasHoldem6PlayerEnv()
-obs = env.reset()
-done = False
-while not done:
-    # For demonstration, choose a random action for the agent
-    action = env.action_space.sample()
-    obs, reward, done, info = env.step(action)
-    env.render()
-print("Hand complete. Reward:", reward)
