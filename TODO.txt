@@ -1,15 +1,19 @@
 TODO
 ----------------------------------------
-- Implementation for A3C
-- Implementation for Monte MonteCarlo
+- Update play.py to support A3c.ipynb
 - Further quantifying model performance. Currently, there is only one real we track performance: Total Reward per hand of poker. Whether this goes up or down basically is the only way we can evaluate what this model is doing. Here are some other ways we can get a better idea of whether the model is good or not:
     - Win rate against baseline opponents (random policy, some hardcoded strategy like always going all in, and previous model versions)
     - Q-value convergence in DQN specifically
     - Reward histogram can show us how varied agent performance is. We can do this with seaborn.
     - Use TensorBoard to log training metrics. Whoever implements this, use this documentation: https://pytorch.org/docs/stable/tensorboard.html
 
+DOING 
+----------------------------------------
+- play.py to run, save, and test models
+
 DONE
 ----------------------------------------
 Model_Train.py is consolidated into a class. Main.py was created as a hub for all the hyperparameter adjustments, model selection, etc.
 
 Plot.py currently plots Total Reward per hand of poker
+- Implementation for A3C
