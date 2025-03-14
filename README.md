@@ -35,6 +35,9 @@ Finally, within the activated shell in the project directory, run
 >pip install -r requirements.txt
 >```
 
+## Background
+As our group was looking to find a topic for our semester project, we thought to look at imperfect games, such as no limit Texas hold’em poker. The longstanding models for the game are a resource to many players, ranging from casual learners to professionals in tournaments. With the ongoing developments in RL learning, we believe that we can use new implementations to improve a model to which hundreds of thousands of paying players use. Our main goal with our project is to give access to players a better strategy for profiting in their games, all while analyzing different, situational playstyles.
+
 ## Methodology
 
 ### Data Generation
