@@ -53,7 +53,7 @@ def play_game():
     env.num_players = 2  
     env.stacks = {0: 1000, 1: 1000}
     
-    checkpoint_path = "../Checkpoints/checkpoint_1.pt" 
+    checkpoint_path = "Checkpoints\checkpoint_1.pt" 
     opponent_model = RobustDQN(input_dim=157, output_dim=6)
     opponent_model.load_state_dict(torch.load(checkpoint_path, map_location=torch.device('cpu')))
     opponent_model.eval()
