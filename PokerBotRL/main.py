@@ -8,10 +8,8 @@ two primary modes of operation via subcommands:
   - simulate: Evaluates a trained agent in a simulation environment using a greedy policy.
 
 Usage:
-    python main.py train [--checkpoint PATH]
-    python main.py simulate [--checkpoint PATH] [--episodes N]
-
-If a checkpoint is provided, it is used to resume training or to load the agent for simulation.
+    python main.py train [--episodes EPISODES] [--random RANGE] [--variable]
+    python main.py simulate [--checkpoint PATH] [--episodes N] [--opponent {model,random,variable}]
 """
 
 import argparse
@@ -21,15 +19,23 @@ def main():
     parser = argparse.ArgumentParser(
         description="Poker RL Agent: Train or simulate the RL agent using a unified interface."
     )
-    subparsers = parser.add_subparsers(dest="command", help="Sub-command to run: 'train' or 'simulate'.")
+    subparsers = parser.add_subparsers(dest="command", required=True,
+                                       help="Sub-command to run: 'train' or 'simulate'.")
 
     # Subparser for training.
     train_parser = subparsers.add_parser("train", help="Train the RL agent.")
     train_parser.add_argument(
-        "--checkpoint", type=str, default="",
-        help="Path to a checkpoint file to resume training (optional)."
+        "--episodes", type=int, default=1000000,
+        help="Total number of training episodes."
     )
-    # You could add additional training-specific arguments here (e.g., number of episodes override).
+    train_parser.add_argument(
+        "--random", type=str, default=None,
+        help="Episode range for using random policy for opponent 1 (format: start-end)."
+    )
+    train_parser.add_argument(
+        "--variable", action="store_true",
+        help="Enable variable training mode for opponent 1 (switch between model and random every 1000 episodes)."
+    )
 
     # Subparser for simulation/evaluation.
     simulate_parser = subparsers.add_parser("simulate", help="Simulate/evaluate the trained RL agent.")
@@ -41,30 +47,26 @@ def main():
         "--episodes", type=int, default=10,
         help="Number of simulation episodes to run."
     )
+    simulate_parser.add_argument(
+        "--opponent", type=str, default="model", choices=["model", "random", "variable"],
+        help="Type of opponent to use: model, random, or variable."
+    )
 
     args = parser.parse_args()
 
     if args.command == "train":
-        # Import and run the training script.
-        from train_rl import train
-        if args.checkpoint:
-            try:
-                import torch
-                checkpoint = torch.load(args.checkpoint)
-                print(f"Resuming training using checkpoint: {args.checkpoint}")
-                train(agent_checkpoint=checkpoint)
-            except Exception as e:
-                print(f"Error loading checkpoint: {e}. Starting training from scratch.")
-                train()
-        else:
-            print("Starting training from scratch.")
-            train()
+        from train import Train
+        print("Starting training.")
+        trainer = Train(episodes=args.episodes, random_range=args.random, variable_mode=args.variable)
+        trainer.run()
     elif args.command == "simulate":
-        # Forward the simulate subcommand arguments to the simulate module.
-        # We adjust sys.argv so that the simulate script can reuse its own argument parser.
-        sys.argv = [sys.argv[0],
-                    "--checkpoint", args.checkpoint,
-                    "--episodes", str(args.episodes)]
+        # Rebuild sys.argv so that simulate.py receives its expected arguments.
+        new_argv = [sys.argv[0]]
+        if args.checkpoint:
+            new_argv += ["--checkpoint", args.checkpoint]
+        new_argv += ["--episodes", str(args.episodes)]
+        new_argv += ["--opponent", args.opponent]
+        sys.argv = new_argv
         from simulate import main as simulate_main
         simulate_main()
     else:

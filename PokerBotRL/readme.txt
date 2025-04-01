@@ -1,90 +1,155 @@
 Poker RL Agent
-This repository contains a reinforcement learning (RL) project designed to train and evaluate an agent for playing full poker. The agent leverages a robust DQN architecture with dueling networks, noisy linear layers, and residual blocks. The code is organized into several modular components that minimize redundancy and promote clean, maintainable design.
+This repository implements a reinforcement learning (RL) agent for playing poker using a dueling DQN architecture with custom layers for exploration and improved gradient flow.
 
 Repository Structure
-models.py
-Defines the core neural network architectures used by the agent, including BestPokerModel and its supporting custom layers (e.g., NoisyLinear and ResidualBlock). It also provides utility functions for converting checkpoints (e.g., from half-poker to full-poker input dimensions).
-
 envs.py
-Contains the poker environment classes.
 
-BaseFullPokerEnv: Implements the basic game logic, such as dealing, betting rounds, stage progression, hand evaluation, and opponent actions.
+Implements poker game environments.
 
-TrainFullPokerEnv: Extends the base environment for training purposes by adding features like tracking all-in events and modified reward computation.
+BaseFullPokerEnv: Core game logic (dealing, betting, stage progression, hand evaluation).
+
+TrainFullPokerEnv: Extends the base environment for training (tracks all-in events and applies modified reward logic).
+
+models.py
+
+Defines the neural network architecture for the RL agent.
+
+Implements custom layers:
+
+NoisyLinear: Linear layer with learnable noise for exploration.
+
+ResidualBlock: Improves gradient flow.
+
+BestPokerModel: Dueling DQN architecture for the agent.
+
+Includes a utility to convert checkpoints from a half-poker model to full-poker dimensions.
 
 utils.py
-Provides shared helper functions, including:
 
-Observation encoders (encode_obs and encode_obs_eval) to transform game states into numeric vectors.
+Contains helper functions for:
 
-Epsilon decay computation for the epsilon-greedy policy.
+Logging decisions.
 
-A ReplayBuffer class for experience replay.
+Encoding observations for training and evaluation.
 
-Logging utilities for debugging and decision tracking.
+Calculating epsilon decay.
 
-train_rl.py
-Implements the main RL training loop. It utilizes BestPokerModel and TrainFullPokerEnv, applies an epsilon-greedy strategy, performs experience replay, periodically updates a target network, and logs performance metrics. Checkpoints and training metrics are periodically saved.
+Storing experiences with a ReplayBuffer.
 
-train_random.py
-Similar to train_rl.py, this script trains the RL agent; however, it explicitly assigns a random action policy to one opponent (e.g., opponent with ID 1) to introduce additional stochasticity during training.
+train.py
 
-simulate.py (or evaluate.py)
-Sets up a simulation environment using BaseFullPokerEnv and runs evaluation episodes using a deterministic, greedy policy. It loads a trained model checkpoint, runs the episodes, and prints detailed results (e.g., rewards, winners, hand scores).
+Runs the training loop using TrainFullPokerEnv and BestPokerModel.
+
+Updates opponent policies in a round-robin fashion (opponents 1–5).
+
+For opponent 1, options exist for using a random policy (via --random) or variable mode (--variable) that switches between model and random policies every 1000 episodes.
+
+Opponents 2–5 are updated with a model-based policy.
+
+Command-line options:
+
+--episodes: Total training episodes.
+
+--random: Episode range for using a random policy for opponent 1.
+
+--variable: Enable variable training mode for opponent 1.
+
+simulate.py
+
+Simulates evaluation episodes using BaseFullPokerEnv.
+
+Allows the use of a trained model checkpoint.
+
+Command-line options:
+
+--checkpoint: Path to a trained model checkpoint.
+
+--episodes: Number of simulation episodes.
+
+--opponent: Type of opponent policy ("model", "random", or "variable").
+
+--output_csv: CSV file path to log simulation results.
+
+plot.py
+
+Provides plotting functionality for training/simulation results.
+
+Supports plotting:
+
+Episode rewards.
+
+Episode outcomes.
+
+Custom metrics.
+
+Command-line options:
+
+Positional argument: CSV file path.
+
+--metric: Metric to plot (reward, episode_outcome, or custom).
+
+--custom_metric: Name of the custom metric (if applicable).
 
 main.py
-Acts as a unified entry point for the project, enabling you to run either training or simulation via subcommands. This file ties together the modules and reduces redundancy in command-line usage.
 
-Prerequisites
-Python 3.7 or higher
+Acts as the central entry point.
+
+Supports subcommands:
+
+train: Starts training.
+
+simulate: Runs simulation/evaluation.
+
+Passes relevant arguments to either train.py or simulate.py.
+
+Usage Examples
+Training the Agent
+Train using default settings (1,000,000 episodes, model policy for all opponents):
+
+bash
+Copy
+python main.py train
+Train with custom parameters:
+
+bash
+Copy
+python main.py train --episodes 500000 --random "1000-2000" --variable
+Running Simulations
+Simulate evaluation with a trained checkpoint:
+
+bash
+Copy
+python main.py simulate --checkpoint "checkpoints/final_agent_checkpoint.pt" --episodes 20 --opponent model
+Or directly:
+
+bash
+Copy
+python simulate.py --checkpoint "checkpoints/final_agent_checkpoint.pt" --episodes 20 --opponent random --output_csv simulation_results.csv
+Plotting Results
+Plot episode rewards from a CSV file:
+
+bash
+Copy
+python plot.py simulation_results.csv --metric reward
+Plot episode outcomes:
+
+bash
+Copy
+python plot.py simulation_results.csv --metric episode_outcome
+Plot a custom metric:
+
+bash
+Copy
+python plot.py simulation_results.csv --metric custom --custom_metric custom_value
+Dependencies
+Python 3.x
 
 PyTorch
 
 NumPy
 
-Other common Python libraries (e.g., random, csv)
+Matplotlib
 
-You can install the necessary dependencies with:
+Standard libraries: argparse, os, random, csv
 
-bash
-Copy
-pip install torch numpy
-(Add any additional dependency installation instructions as needed.)
-
-How to Run
-Training the Agent
-To train the RL agent from scratch or resume from a checkpoint, run:
-
-bash
-Copy
-python main.py train --checkpoint path/to/optional_checkpoint.pt
-If no checkpoint is provided, training will start from scratch.
-
-Training metrics (e.g., episode reward, average reward, epsilon value) are logged to the console and saved periodically as CSV files in the checkpoints directory.
-
-Training with a Random Opponent Policy
-To train the agent while one opponent follows a random action policy, run:
-
-bash
-Copy
-python train_random.py --checkpoint path/to/optional_checkpoint.pt
-This script is similar to the standard training loop but explicitly assigns a random policy to one of the opponent agents.
-
-Evaluating/Simulating the Agent
-To evaluate a trained model using a greedy (deterministic) policy, run:
-
-bash
-Copy
-python main.py simulate --checkpoint path/to/trained_checkpoint.pt --episodes 10
-This command runs 10 simulation episodes using the provided checkpoint and prints the episode rewards and additional game outcome details (like winners and scores) for analysis.
-
-Performance Metrics Logging
-Both training scripts log key performance metrics during training:
-
-Episode Reward: The cumulative reward for each episode.
-
-Average Reward: The moving average of rewards over recent episodes (e.g., the last 100 episodes).
-
-Epsilon Value: The current exploration rate, as computed by the epsilon decay function.
-
-These metrics are printed at regular intervals (e.g., every 100 episodes) and periodically saved to CSV files in the checkpoint directory, allowing you to monitor training progress and analyze performance over time.
+This README provides a brief overview of the project's components and how to use the various scripts. For further details, please refer to the inline documentation within each file.

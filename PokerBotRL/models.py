@@ -15,8 +15,11 @@ These components are intended to be imported and used by training and evaluation
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
-
+# ---------------------------------------------------------------------------
+# NoisyLinear Layer
+# ---------------------------------------------------------------------------
 class NoisyLinear(nn.Module):
     """
     NoisyLinear implements a linear transformation with added learnable noise.
@@ -67,7 +70,9 @@ class NoisyLinear(nn.Module):
             bias = self.bias_mu
         return F.linear(x, weight, bias)
 
-
+# ---------------------------------------------------------------------------
+# ResidualBlock
+# ---------------------------------------------------------------------------
 class ResidualBlock(nn.Module):
     """
     ResidualBlock implements a basic residual connection with two linear layers.
@@ -90,7 +95,9 @@ class ResidualBlock(nn.Module):
         out = self.layer_norm(out)
         return F.relu(out)
 
-
+# ---------------------------------------------------------------------------
+# BestPokerModel (Dueling DQN Architecture)
+# ---------------------------------------------------------------------------
 class BestPokerModel(nn.Module):
     """
     BestPokerModel defines the RL agent architecture used in training.
@@ -142,7 +149,9 @@ class BestPokerModel(nn.Module):
         self.advantage_fc.reset_noise()
         self.advantage_out.reset_noise()
 
-
+# ---------------------------------------------------------------------------
+# Checkpoint Conversion Utility
+# ---------------------------------------------------------------------------
 def convert_half_to_full_state_dict(old_state_dict: dict) -> dict:
     """
     Convert a state dict from a half-poker model (reduced input dimensions) to
