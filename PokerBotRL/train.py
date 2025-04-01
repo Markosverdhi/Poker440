@@ -89,7 +89,8 @@ class Train:
                 random_checkpoint = random.choice(checkpoint_files)
                 full_checkpoint_path = os.path.join(self.checkpoint_dir, random_checkpoint)
                 opp_checkpoint = torch.load(full_checkpoint_path, map_location=self.device)
-                if opp_checkpoint["fc1.weight"].shape[1] == (26 + 1 + (NUM_PLAYERS - 1) * 26):
+                # Guard against missing key 'fc1.weight'
+                if "fc1.weight" in opp_checkpoint and opp_checkpoint["fc1.weight"].shape[1] == (26 + 1 + (NUM_PLAYERS - 1) * 26):
                     opp_checkpoint = convert_half_to_full_state_dict(opp_checkpoint)
                     print(f"Converted checkpoint {random_checkpoint} from half to full dimensions.")
                 opponent_model = BestPokerModel(input_dim=STATE_DIM, num_actions=NUM_ACTIONS).to(self.device)
