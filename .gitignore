@@ -1,7 +1,0 @@
-ds440
-data
-/data/
-*.log
-.vscode/
-__pycache__/
-*.pyc
