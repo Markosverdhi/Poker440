@@ -1,155 +1,48 @@
-Poker RL Agent
-This repository implements a reinforcement learning (RL) agent for playing poker using a dueling DQN architecture with custom layers for exploration and improved gradient flow.
-
-Repository Structure
-envs.py
-
-Implements poker game environments.
-
-BaseFullPokerEnv: Core game logic (dealing, betting, stage progression, hand evaluation).
-
-TrainFullPokerEnv: Extends the base environment for training (tracks all-in events and applies modified reward logic).
-
-models.py
-
-Defines the neural network architecture for the RL agent.
-
-Implements custom layers:
-
-NoisyLinear: Linear layer with learnable noise for exploration.
-
-ResidualBlock: Improves gradient flow.
-
-BestPokerModel: Dueling DQN architecture for the agent.
-
-Includes a utility to convert checkpoints from a half-poker model to full-poker dimensions.
-
-utils.py
-
-Contains helper functions for:
-
-Logging decisions.
-
-Encoding observations for training and evaluation.
-
-Calculating epsilon decay.
-
-Storing experiences with a ReplayBuffer.
-
-train.py
-
-Runs the training loop using TrainFullPokerEnv and BestPokerModel.
-
-Updates opponent policies in a round-robin fashion (opponents 1–5).
-
-For opponent 1, options exist for using a random policy (via --random) or variable mode (--variable) that switches between model and random policies every 1000 episodes.
-
-Opponents 2–5 are updated with a model-based policy.
-
-Command-line options:
-
---episodes: Total training episodes.
-
---random: Episode range for using a random policy for opponent 1.
-
---variable: Enable variable training mode for opponent 1.
-
-simulate.py
-
-Simulates evaluation episodes using BaseFullPokerEnv.
-
-Allows the use of a trained model checkpoint.
-
-Command-line options:
-
---checkpoint: Path to a trained model checkpoint.
-
---episodes: Number of simulation episodes.
-
---opponent: Type of opponent policy ("model", "random", or "variable").
-
---output_csv: CSV file path to log simulation results.
-
-plot.py
-
-Provides plotting functionality for training/simulation results.
-
-Supports plotting:
-
-Episode rewards.
-
-Episode outcomes.
-
-Custom metrics.
-
-Command-line options:
-
-Positional argument: CSV file path.
-
---metric: Metric to plot (reward, episode_outcome, or custom).
-
---custom_metric: Name of the custom metric (if applicable).
-
-main.py
-
-Acts as the central entry point.
-
-Supports subcommands:
-
-train: Starts training.
-
-simulate: Runs simulation/evaluation.
-
-Passes relevant arguments to either train.py or simulate.py.
-
-Usage Examples
-Training the Agent
-Train using default settings (1,000,000 episodes, model policy for all opponents):
-
-bash
-Copy
-python main.py train
-Train with custom parameters:
-
-bash
-Copy
-python main.py train --episodes 500000 --random "1000-2000" --variable
-Running Simulations
-Simulate evaluation with a trained checkpoint:
-
-bash
-Copy
-python main.py simulate --checkpoint "checkpoints/final_agent_checkpoint.pt" --episodes 20 --opponent model
-Or directly:
-
-bash
-Copy
-python simulate.py --checkpoint "checkpoints/final_agent_checkpoint.pt" --episodes 20 --opponent random --output_csv simulation_results.csv
-Plotting Results
-Plot episode rewards from a CSV file:
-
-bash
-Copy
-python plot.py simulation_results.csv --metric reward
-Plot episode outcomes:
-
-bash
-Copy
-python plot.py simulation_results.csv --metric episode_outcome
-Plot a custom metric:
-
-bash
-Copy
-python plot.py simulation_results.csv --metric custom --custom_metric custom_value
-Dependencies
-Python 3.x
-
-PyTorch
-
-NumPy
-
-Matplotlib
-
-Standard libraries: argparse, os, random, csv
-
-This README provides a brief overview of the project's components and how to use the various scripts. For further details, please refer to the inline documentation within each file.
+PokerBotRLA reinforcement learning agent for playing No-Limit Texas Hold'em poker, built using PyTorch and Gymnasium. This project includes capabilities for training the agent, simulating games against various opponent types, analyzing agent decisions, and playing against the agent via a graphical user interface.FeaturesRL Agent Training: Train a poker agent using a Dueling DQN architecture (scripts/train.py). Supports resuming from checkpoints and configuring opponent strategies during training.Game Simulation: Simulate tournament-style poker games featuring the trained agent against configurable opponents (model-based, random, etc.) using scripts/simulate.py. Generates summary and detailed logs.Graphical User Interface: Play poker against the trained agent and other opponent types in a visual interface (scripts/main_ui.py).Decision Analysis: Analyze the agent's performance and decision-making based on simulation logs (analysis/decision_analysis.py).Plotting: Visualize training or simulation results (e.g., rewards) using analysis/plot.py.Project StructureThe codebase is organized into the following main directories:PokerBotRL/
+├── main.py                 # Main entry point, command dispatcher
+├── README.md               # This file
+├── code_walkthrough.ipynb  # Detailed explanation and runnable examples
+├── poker_rl_core/          # Core logic package (environment, models, utils)
+│   ├── __init__.py
+│   ├── envs.py
+│   ├── models.py
+│   ├── utils.py
+│   ├── card_utils.py
+│   └── seat_config.py
+├── scripts/                # Runnable scripts (train, simulate, ui)
+│   ├── train.py
+│   ├── simulate.py
+│   └── main_ui.py
+├── analysis/               # Analysis tools (plotting, decision analysis)
+│   ├── __init__.py
+│   ├── decision_analysis.py
+│   ├── human_action_handler.py
+│   └── plot.py
+├── checkpoints/            # Default location for saved model checkpoints
+└── *.csv                   # Output files from simulation/analysis (e.g., detailed_simulation_log.csv)
+For a detailed explanation of each file, please refer to code_walkthrough.ipynb.Setup and InstallationPrerequisites:Python 3.xGit (optional, for cloning)Clone the Repository (Optional):git clone <your-repository-url>
+cd PokerBotRL
+Create a Virtual Environment (Recommended):python -m venv venv
+# Activate the environment
+# Windows:
+.\venv\Scripts\activate
+# macOS/Linux:
+source venv/bin/activate
+Install Dependencies:It's good practice to create a requirements.txt file. Based on the code, key dependencies are:torch
+numpy
+gymnasium
+matplotlib
+Install them using pip:pip install torch numpy gymnasium matplotlib
+# Or if you create requirements.txt:
+# pip install -r requirements.txt
+Usage (Command-Line Interface)The primary way to interact with the project is through main.py.General Help:To see all available commands and general options:python main.py --help
+Commands:Train (train)Purpose: Train the RL agent.Help: python main.py train --helpExample (start new training for 100k episodes):python main.py train --episodes 100000
+Example (resume from checkpoint):# Replace with your actual checkpoint path
+python main.py train --episodes 50000 --resume checkpoints/checkpoint_1000.pt
+Simulate (simulate)Purpose: Run simulations using a trained agent. Requires a checkpoint file.Help: python main.py simulate --helpExample (run 10 episodes):# Replace with your actual checkpoint path
+python main.py simulate --checkpoint checkpoints/final_agent_model.pt --episodes 10
+Example (with custom seat config and log name):python main.py simulate --checkpoint checkpoints/final_agent_model.pt --episodes 5 --seat_config "agent,random,model,empty,model,random" --detailed_log my_sim_log.csv
+Analyze (analyze)Purpose: Analyze a detailed simulation log file. Requires the log file to exist.Help: python main.py analyze --helpExample (analyze default log):# Requires detailed_simulation_log.csv from a previous simulation
+python main.py analyze --detailed_log detailed_simulation_log.csv
+UI (ui)Purpose: Launch the graphical user interface for playing poker.Help: python main.py ui --help (Currently no specific arguments)Example:python main.py ui
+(Note: The UI might require a default checkpoint file like checkpoints/final_agent_model.pt to exist to function correctly).Code WalkthroughFor a more detailed guide through the code structure and runnable examples of the commands, please see the code_walkthrough.ipynb notebook.DependenciesPyTorchGymnasium (formerly OpenAI Gym)NumPyMatplotlib (for plot.py)(Add license information here if applicable)(Add contribution guidelines here if applicable)

@@ -1,57 +1,67 @@
+# filename: main.py
 """
-main.py
+Unified interface for running Poker RL Agent commands: train, simulate, analyze, ui.
 
-Unified interface for running Poker RL Agent commands: train, simulate, analyze.
-
-MODIFIED (Gymnasium Adaptation):
-- Simplified 'train' command handling:
-    - Removed torch.load and model monkey-patching logic for checkpoints.
-    - Passes the checkpoint path directly to train.Train() via the 'resume_from'
-      argument, as train.py now handles resuming internally.
-- Kept 'simulate' and 'analyze' command handling using sys.argv rebuilding,
-  but added comments suggesting potential future improvements.
+MODIFIED (Structure & UI Integration):
+- Updated imports to work with the new folder structure (poker_rl_core, scripts, analysis).
+- Added a 'ui' subcommand to launch the Tkinter GUI (main_ui.py).
+- Refactored 'train' command to directly import and call the Train class.
+- Kept sys.argv rebuilding for 'simulate' and 'analyze' for compatibility with
+  their current internal argparse, but updated import paths. Added notes
+  about potential future refactoring for those scripts.
 """
 
 import argparse
 import sys
-import torch  # Still potentially needed by imported modules indirectly
+import os
+
+# Add the project root directory to the Python path to allow imports like
+# from poker_rl_core import ... or from scripts import ...
+# This assumes main.py is in the project root (PokerBotRL).
+project_root = os.path.dirname(os.path.abspath(__file__))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Poker RL Agent: Train, simulate, or analyze the RL agent using a unified interface."
+        description="Poker RL Agent: Train, simulate, analyze, or run the UI.",
+        formatter_class=argparse.RawTextHelpFormatter # Keep formatting in help messages
     )
     subparsers = parser.add_subparsers(dest="command", required=True,
-                                       help="Sub-command to run: 'train', 'simulate', or 'analyze'.")
+                                       help="Sub-command to run:\n"
+                                            "  train    - Train the RL agent.\n"
+                                            "  simulate - Simulate games with a trained agent.\n"
+                                            "  analyze  - Analyze detailed simulation logs.\n"
+                                            "  ui       - Run the graphical user interface.")
 
     # --- Subparser for training ---
     train_parser = subparsers.add_parser("train", help="Train the RL agent.")
     train_parser.add_argument(
-        "--episodes", type=int, default=100000, # Default from original
-        help="Total number of training episodes."
+        "--episodes", type=int, default=100000,
+        help="Total number of training tournaments (episodes)."
     )
     train_parser.add_argument(
         "--random", type=str, default=None,
-        help="Episode range for using random policy for opponent 1 (format: start-end)."
+        help="Tournament range for using random policy for opponent 1 (format: start-end)."
     )
     train_parser.add_argument(
         "--variable", action="store_true",
         help="Enable variable training mode for opponent 1 (switch between model and random periodically)."
     )
-    # Changed argument name from --checkpoint to --resume for clarity, matching train.py
     train_parser.add_argument(
-        "--resume", type=str, default=None, # Default is None (start fresh)
+        "--resume", type=str, default=None,
         help="Path to an existing model checkpoint file (.pt) to resume training from."
     )
 
     # --- Subparser for simulation/evaluation ---
     simulate_parser = subparsers.add_parser("simulate", help="Simulate/evaluate the trained RL agent.")
     simulate_parser.add_argument(
-        "--checkpoint", type=str, default="", required=True, # Make checkpoint required for simulation
+        "--checkpoint", type=str, required=True,
         help="Path to the trained model checkpoint (.pt) REQUIRED for simulation."
     )
     simulate_parser.add_argument(
         "--episodes", type=int, default=10,
-        help="Number of simulation episodes to run."
+        help="Number of simulation episodes (tournaments) to run."
     )
     simulate_parser.add_argument(
         "--opponent", type=str, default="model", choices=["model", "random", "variable"],
@@ -60,12 +70,18 @@ def main():
     simulate_parser.add_argument(
         "--seat_config", type=str, default="",
         help="Comma-separated list for each seat (0 to NUM_PLAYERS-1). "
-             "Seat 0 must be 'agent'; others can be 'model', 'random', or 'variable'."
+             "Seat 0 must be 'agent'; others can be 'model', 'random', 'variable', or 'empty'."
     )
     simulate_parser.add_argument(
         "--detailed_log", type=str, default="detailed_simulation_log.csv",
         help="Path to the CSV file to store detailed game state and action logs."
     )
+    # Add output_csv argument consistent with simulate.py's internal parsing
+    simulate_parser.add_argument(
+        "--output_csv", type=str, default="simulation_results.csv",
+         help="Path to the CSV file to store simulation summary results."
+    )
+
 
     # --- Subparser for decision analysis ---
     analyze_parser = subparsers.add_parser("analyze", help="Analyze detailed simulation logs and compare decisions.")
@@ -77,37 +93,45 @@ def main():
         "--output_analysis", type=str, default="decision_analysis_summary.csv",
         help="Path to save the analysis summary."
     )
+    # Add agent_id argument consistent with decision_analysis.py's internal parsing
+    analyze_parser.add_argument(
+        "--agent_id", type=int, default=1,
+        help="Player ID (1-based) of the agent to analyze."
+    )
+
+    # --- Subparser for UI ---
+    ui_parser = subparsers.add_parser("ui", help="Run the graphical user interface.")
+    # Add arguments if the UI needs them (e.g., default checkpoint path)
+    # ui_parser.add_argument("--checkpoint", type=str, help="Optional path to a model checkpoint for the UI.")
 
     args = parser.parse_args()
 
     # --- Execute Commands ---
     if args.command == "train":
         try:
-            # Import the updated Train class
-            from train import Train
-        except ImportError:
-            print("Error: Could not import Train from train.py. Ensure train.py exists and is updated.")
+            # Import the Train class from the scripts folder
+            from Scripts.train import Train
+        except ImportError as e:
+            print(f"Error: Could not import Train from scripts.train: {e}")
+            print("Ensure the folder structure is correct and __init__.py exists if needed.")
             sys.exit(1)
 
         print("Starting training process...")
-        # Initialize Train with argparse arguments.
-        # Pass the --resume argument directly to the Train class constructor.
+        # Initialize Train directly with argparse arguments.
         trainer = Train(
             episodes=args.episodes,
             random_range=args.random,
             variable_mode=args.variable,
-            resume_from=args.resume # Pass checkpoint path here
+            resume_from=args.resume
         )
         trainer.run()
         print("Training finished.")
 
     elif args.command == "simulate":
         print("Starting simulation process...")
-        # Rebuild sys.argv so that simulate.py receives its expected arguments.
-        # NOTE: This method works but is less robust than directly calling a
-        # function in simulate.py with arguments. Consider refactoring simulate.py
-        # in the future to accept arguments via a function call instead of parsing sys.argv.
-        new_argv = [sys.argv[0]] # Script name
+        # NOTE: This still uses sys.argv rebuilding. Ideally, simulate.py
+        # should be refactored to have a function that accepts arguments directly.
+        new_argv = [sys.argv[0]] # Script name (remains simulate.py for its internal parser)
         new_argv += ["--checkpoint", args.checkpoint]
         new_argv += ["--episodes", str(args.episodes)]
         new_argv += ["--opponent", args.opponent]
@@ -115,38 +139,93 @@ def main():
             new_argv += ["--seat_config", args.seat_config]
         if args.detailed_log:
             new_argv += ["--detailed_log", args.detailed_log]
-        # Overwrite sys.argv for the simulate script's internal argparse
+        if args.output_csv:
+             new_argv += ["--output_csv", args.output_csv]
+
         original_argv = sys.argv
-        sys.argv = new_argv
+        # Set the first element to the actual simulate script path for its argparse
+        simulate_script_path = os.path.join(project_root, 'scripts', 'simulate.py')
+        sys.argv = [simulate_script_path] + new_argv[1:]
+
         try:
-            from simulate import main as simulate_main
-            simulate_main()
-        except ImportError:
-             print("Error: Could not import main from simulate.py. Ensure simulate.py exists and is updated.")
+            # Import the main function from the simulate script
+            from Scripts.simulate import main as simulate_main
+            simulate_main() # Call the main function which handles its own argparse
+        except ImportError as e:
+             print(f"Error: Could not import main from scripts.simulate: {e}")
+             print("Ensure the folder structure is correct and __init__.py exists if needed.")
              sys.exit(1)
+        except SystemExit as e:
+             # Catch SystemExit from simulate's argparse if args are invalid
+             if e.code != 0: print(f"Exiting due to error in simulate script (code: {e.code}).")
         finally:
              sys.argv = original_argv # Restore original argv
         print("Simulation finished.")
 
     elif args.command == "analyze":
         print("Starting analysis process...")
-        # Rebuild sys.argv for decision_analysis.py
-        # NOTE: Similar comment as for simulate applies here regarding sys.argv rebuilding.
-        new_argv = [sys.argv[0]] # Script name
+        # NOTE: This still uses sys.argv rebuilding. Ideally, decision_analysis.py
+        # should be refactored to have a function that accepts arguments directly.
+        new_argv = [sys.argv[0]] # Script name (remains decision_analysis.py for its internal parser)
         new_argv += ["--detailed_log", args.detailed_log]
         new_argv += ["--output_analysis", args.output_analysis]
-        # Overwrite sys.argv for the analysis script's internal argparse
+        new_argv += ["--agent_id", str(args.agent_id)]
+
         original_argv = sys.argv
-        sys.argv = new_argv
+        # Set the first element to the actual analysis script path for its argparse
+        analyze_script_path = os.path.join(project_root, 'analysis', 'decision_analysis.py')
+        sys.argv = [analyze_script_path] + new_argv[1:]
+
         try:
-            from decision_analysis import main as analyze_main
-            analyze_main()
-        except ImportError:
-             print("Error: Could not import main from decision_analysis.py. Ensure decision_analysis.py exists.")
+            # Import the main function from the analysis script
+            from Scripts.decision_analysis import main as analyze_main
+            analyze_main() # Call the main function which handles its own argparse
+        except ImportError as e:
+             print(f"Error: Could not import main from analysis.decision_analysis: {e}")
+             print("Ensure the folder structure is correct and __init__.py exists if needed.")
              sys.exit(1)
+        except SystemExit as e:
+             # Catch SystemExit from analyze's argparse if args are invalid
+             if e.code != 0: print(f"Exiting due to error in analysis script (code: {e.code}).")
         finally:
              sys.argv = original_argv # Restore original argv
         print("Analysis finished.")
+
+    elif args.command == "ui":
+        print("Launching Poker UI...")
+        try:
+            # Import Tkinter and the PokerApp class
+            import tkinter as tk
+            from Front_End.main_ui import PokerApp
+        except ImportError as e:
+            print(f"Error: Could not import UI components: {e}")
+            print("Ensure tkinter is installed and the folder structure is correct.")
+            sys.exit(1)
+
+        try:
+            root = tk.Tk()
+            root.withdraw() # Hide the main root window
+
+            # Optional: Apply theme if needed (copied from main_ui.py)
+            try:
+                from tkinter import ttk
+                style = ttk.Style(root)
+                available_themes = style.theme_names()
+                preferred_themes = ['clam', 'alt', 'default']
+                for theme in preferred_themes:
+                    if theme in available_themes:
+                         try: style.theme_use(theme); break
+                         except tk.TclError: pass
+            except Exception: pass # Ignore styling errors
+
+            app = PokerApp(root) # Create the application instance
+            root.mainloop() # Start the Tkinter event loop
+        except Exception as e:
+            print(f"Error launching UI: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        print("UI closed.")
 
     else:
         # This case should not be reached due to subparsers(required=True)
