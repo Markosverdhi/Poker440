@@ -1,15 +1,3 @@
-# filename: decision_analysis.py
-"""
-Analyzes detailed simulation logs for poker agent decisions.
-
-MODIFIED:
-- Changed references from 'Observation' column to 'ObservationDict' to match
-  the actual header in detailed_simulation_log.csv.
-- Changed output paths for plots and summary to use the 'Output_CSVs/' directory.
-- Added '--agent_id' argument to the internal ArgumentParser.
-- Modified 'analyze_decisions' function to accept and use agent_id.
-"""
-
 import argparse
 import json
 import pandas as pd

@@ -70,8 +70,8 @@ class Train:
         self.gamma = 0.99 # Discount factor
         self.target_update_freq = 500 # Update target less frequently? (Adjust based on steps/tournament)
         self.opponent_update_freq = 500 # Tournaments between opponent updates
-        self.checkpoint_save_freq = 1000 # Tournaments between checkpoints
-        self.metrics_save_freq = 100 # Tournaments between metric saves
+        self.checkpoint_save_freq = 200 # Tournaments between checkpoints
+        self.metrics_save_freq = 10 # Tournaments between metric saves
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
@@ -298,6 +298,17 @@ class Train:
             episode_rewards.append(tournament_reward); avg_reward = np.mean(episode_rewards[-100:]) if episode_rewards else 0.0; current_epsilon = epsilon_by_frame(global_step)
             metrics_list.append({'episode': episode, 'reward': tournament_reward, 'avg_reward': avg_reward, 'steps': tournament_agent_steps, 'epsilon': current_epsilon})
             if episode % 100 == 0 or episode == self.num_episodes: print(f"T: {episode}, AgentSteps: {tournament_agent_steps}, T-Reward: {tournament_reward:.2f}, Avg T-Rew: {avg_reward:.2f}, Eps: {current_epsilon:.4f}, GlobalStep: {global_step}")
+
+            if episode % self.checkpoint_save_freq == 0 or episode == self.num_episodes:
+                chk = {
+                    'agent_state_dict': agent.state_dict(),
+                    'target_net_state_dict': target_net.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'episode': episode,
+                    'global_step': global_step
+                }
+                path = os.path.join(self.checkpoint_dir, f'checkpoint_{episode}.pt')
+                torch.save(chk, path)
 
             # --- Opponent Updates, Checkpointing, Metrics Saving ---
             if episode % self.metrics_save_freq == 0 or episode == self.num_episodes:
