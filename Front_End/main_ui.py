@@ -1,1173 +1,2394 @@
-# filename: package/main_ui.py
-"""
-Main UI for Poker Game using Gymnasium-compliant Environment (Tournament Structure).
-
-MODIFIED (Round Transition Fix v2):
-- Refined _process_game_turn logic when current_player_id is None to ensure
-  _step_env(-1) is called reliably to trigger the start of the next round.
-
-MODIFIED (Refactoring):
-- Removed local `_load_model` and `get_opponent_policy` functions.
-- Imported `load_agent_model` and `get_opponent_policy` from `utils.py`.
-- Updated `_start_game` to use imported functions.
-
-MODIFIED (Empty Seat Handling):
-- Updated _start_game to pass seat_configs to the TrainFullPokerEnv constructor.
-- Updated _update_ui to visually gray out and clear info for 'Empty' seats.
-
-MODIFIED (Layout & Showdown Fixes):
-- Moved Pot display below player hand in the center.
-- Added a dedicated multi-line label (`showdown_overview_label`) below the pot
-  for displaying round winner/hand summary text.
-- Modified `_display_round_results` to display ALL dealt hands and populate overview.
-- Modified `_update_ui` to clear overview label when round is not over.
-
-MODIFIED (Fix Human ID Detection):
-- Corrected the loop in `_start_game` to properly identify the human player's
-  seat index by removing an erroneous semicolon and ensuring correct indentation.
-
-MODIFIED (UI Size Adjustment & Error Fix):
-- Increased `seat_height` in `_create_game_window` to make player info boxes taller.
-- Added a None check for `current_player_id` in `_handle_ai_action` to prevent TypeError.
-
-MODIFIED (Community Card Debugging):
-- Added a print statement in `_update_ui` to log the community cards being received
-  from the environment's info dictionary just before rendering. (Can be commented out later)
-"""
-
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox, filedialog
 import os
-import torch
+import sys
+import time
 import random
-import json
-import numpy as np
-import time # For potential delays
-
-# --- Attempt to import necessary custom modules ---
+import math
+# Conditional import for torch, only if needed for AI models
 try:
-    # Assuming these modules are in the same directory or accessible via PYTHONPATH
-    from Back_End.envs import TrainFullPokerEnv, evaluate_hand # Use the updated envs.py
-    # *** Import refactored functions from utils ***
-    from Back_End.utils import encode_obs_eval, load_agent_model, get_opponent_policy
-    from Back_End.constants import NEW_STATE_DIM
-    from .card_utils import render_card_ascii, render_hand_for_labels, render_community_cards_for_labels, render_hand
-    from .seat_config import SeatConfigManager
-except ImportError as e:
-    # Provide a more informative error message if imports fail
-    print(f"ERROR: Critical modules not found or import failed. Ensure 'envs.py', 'utils.py', 'card_utils.py', 'seat_config.py', 'models.py' are available and updated.")
-    print(f"Import Error Details: {e}")
-    # Use tkinter to show the error if possible, otherwise exit
-    try:
-        root = tk.Tk()
-        root.withdraw() # Hide the main window
-        messagebox.showerror("Import Error", f"Critical modules not found or failed to import. Ensure required files are available and updated.\n\nDetails: {e}\n\nApplication will now exit.")
-        root.destroy()
-    except tk.TclError:
-        pass # If tkinter itself fails, just exit
-    exit(1) # Exit with an error code
-
-# Assuming models.py is available and updated for NEW_STATE_DIM
-try:
-    from Back_End.models import BestPokerModel
+    import torch
 except ImportError:
-    print("ERROR: 'models.py' not found. Ensure it is available.")
+    print("Warning: PyTorch not found. AI model functionality will be disabled.")
+    torch = None # Define torch as None if not available
+
+from PIL import Image, ImageTk, ImageDraw, ImageFont
+
+# --- Adjust imports based on your project structure ---
+# This block attempts to import modules relative to the script's location first,
+# then falls back to assuming a specific project structure if relative imports fail.
+try:
+    # Assume relative imports work from within a package (e.g., running as part of Front_End)
+    from .poker_theme import PokerTheme
+    from .animations import AnimationManager
+    from .seat_config import SeatConfigManager
+    # Add Back_End to sys.path relative to this file's directory
+    # This allows finding modules in the sibling 'Back_End' directory
+    backend_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Back_End'))
+    if backend_path not in sys.path:
+        sys.path.append(backend_path)
+    from Back_End.envs import BaseFullPokerEnv # Assuming BaseFullPokerEnv is directly in Back_End/envs
+    from Back_End.utils import load_agent_model, get_opponent_policy, encode_obs_eval # Assuming these are in Back_End/utils
+    from Back_End.constants import NUM_PLAYERS, ACTION_LIST, NUM_ACTIONS, STARTING_STACK # Assuming these are in Back_End/constants
+    from .card_utils import render_hand # Assuming relative import for card_utils works
+    print("Relative imports successful.")
+except ImportError as e:
+    print(f"Error importing modules using relative paths: {e}")
+    print("Attempting fallback imports (assuming script is run from project root or similar)...")
+    # Fallback: Assumes 'Front_End' and 'Back_End' are top-level directories accessible from cwd
     try:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("Import Error", "Module 'models.py' not found. Application will now exit.")
-        root.destroy()
-    except tk.TclError:
-        pass
-    exit(1)
+        # Get parent directory of the current script's directory might be needed if running script directly
+        # parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        # if parent_dir not in sys.path:
+        #      sys.path.append(parent_dir) # Add project root to path
+
+        # Try importing assuming Front_End and Back_End are importable packages
+        from .poker_theme import PokerTheme
+        from .animations import AnimationManager
+        from .seat_config import SeatConfigManager
+        from Back_End.envs import BaseFullPokerEnv
+        from Back_End.utils import load_agent_model, get_opponent_policy, encode_obs_eval
+        from Back_End.constants import NUM_PLAYERS, ACTION_LIST, NUM_ACTIONS, STARTING_STACK
+        from .card_utils import render_hand
+        print("Fallback imports successful.")
+    except ImportError as e2:
+        print(f"Fallback import failed: {e2}")
+        messagebox.showerror("Import Error", f"Could not import necessary game modules.\nPlease ensure the project structure allows importing 'Front_End' and 'Back_End' modules.\nError: {e2}")
+        sys.exit(1)
+# --- End Imports ---
 
 
-# --- Constants ---
-NUM_PLAYERS = 6           # Total number of seats at the table
-STATE_DIM = NEW_STATE_DIM # Expected dimension of the encoded state from utils.py
-MONOSPACE_FONT = ("Consolas", 10) # Preferred font for card rendering
-EMPTY_SEAT_COLOR = "gray" # Color for text in empty seats
+class CardImageGenerator:
+    """
+    Generates and caches images for playing cards using PIL and Tkinter.
+    Handles card faces, backs, placeholders, and resizing.
+    """
+    def __init__(self, card_width=80, card_height=120):
+        """
+        Initializes the generator with base card dimensions.
 
-# --- REMOVED get_opponent_policy function (now imported from utils) ---
+        Args:
+            card_width (int): Base width for generated cards.
+            card_height (int): Base height for generated cards.
+        """
+        self.base_card_width = card_width
+        self.base_card_height = card_height
+        self.card_images = {} # Cache for generated ImageTk.PhotoImage objects { (code, size): PhotoImage }
+
+        # Generate default placeholder immediately with base size
+        self._default_placeholder_image = self._create_placeholder_image((self.base_card_width, self.base_card_height))
+        if self._default_placeholder_image:
+            # Convert the default PIL image to PhotoImage for direct use
+            self.default_placeholder = ImageTk.PhotoImage(self._default_placeholder_image)
+        else:
+            # Fallback if placeholder creation failed (should not happen ideally)
+            self.default_placeholder = None
+            print("CRITICAL WARNING: Failed to create default placeholder image.")
+
+    def get_card_image(self, card_code, size=None):
+        """
+        Retrieves or generates a PhotoImage for a given card code and size.
+
+        Args:
+            card_code (str): Standard 2-character card code (e.g., "As", "Td", "Kc") or "??", or "placeholder".
+            size (tuple, optional): (width, height) for the desired image size. Defaults to base size.
+
+        Returns:
+            ImageTk.PhotoImage: The requested card image, or a placeholder if generation fails.
+        """
+        # Determine target size, defaulting to base size
+        target_size = size or (self.base_card_width, self.base_card_height)
+        target_size = (int(target_size[0]), int(target_size[1])) # Ensure integers
+        cache_key = (card_code, target_size)
+
+        # --- Check Cache ---
+        if cache_key in self.card_images:
+            # Check if the cached PhotoImage is still valid (Tkinter objects can become invalid)
+            try:
+                 # Accessing a property like width will raise TclError if invalid
+                 _ = self.card_images[cache_key].width()
+                 return self.card_images[cache_key] # Return cached image if valid
+            except (tk.TclError, AttributeError):
+                # print(f"Cached image for {cache_key} is invalid, regenerating.")
+                del self.card_images[cache_key] # Remove invalid entry
+
+        # --- Validate Size ---
+        if target_size[0] <= 0 or target_size[1] <= 0:
+            # print(f"Warning: Requested invalid size {target_size} for card '{card_code}'. Using placeholder.")
+            return self.get_placeholder_image() # Return default placeholder
+
+        # --- Generate PIL Image ---
+        img = None # Initialize img to None
+        if card_code == "??" or card_code is None:
+            img = self._create_card_back(target_size)
+        elif card_code == "placeholder": # Explicit request for placeholder
+             img = self._create_placeholder_image(target_size)
+        else:
+            # Basic validation for card code format (optional but helpful)
+            if isinstance(card_code, str) and len(card_code) == 2 and card_code[0] in "23456789TJQKA" and card_code[1] in "SHDC":
+                 img = self._create_card_image(card_code, target_size)
+            else:
+                 print(f"Warning: Invalid card code format '{card_code}'. Generating placeholder.")
+                 img = self._create_placeholder_image(target_size)
+
+
+        # Handle PIL image creation failure
+        if img is None:
+            # print(f"Warning: Failed to create PIL image for {cache_key}. Using placeholder.")
+            return self.get_placeholder_image(target_size) # Attempt specific size placeholder
+
+        # --- Convert PIL Image to PhotoImage ---
+        try:
+            photo_img = ImageTk.PhotoImage(img)
+            self.card_images[cache_key] = photo_img # Store in cache
+            return photo_img
+        except Exception as e:
+            # This can happen if Tkinter is shutting down, image data is corrupt, etc.
+            print(f"Error creating PhotoImage for {cache_key}: {e}")
+            # Fallback to placeholder on PhotoImage creation error
+            return self.get_placeholder_image(target_size)
+
+    def get_card_back(self, size=None):
+        """Gets a card back image at the specified size."""
+        target_size = size or (self.base_card_width, self.base_card_height)
+        return self.get_card_image("??", target_size)
+
+    def get_placeholder_image(self, size=None):
+        """Gets a placeholder image at the specified size."""
+        target_size = size or (self.base_card_width, self.base_card_height)
+        target_size = (int(target_size[0]), int(target_size[1])) # Ensure integers
+
+        # Use default if no specific size requested and default exists
+        if size is None and self.default_placeholder:
+            return self.default_placeholder
+
+        cache_key = ("placeholder", target_size)
+
+        # Check cache for specific size placeholder
+        if cache_key in self.card_images:
+             # Check if the cached PhotoImage is still valid
+            try:
+                 _ = self.card_images[cache_key].width()
+                 return self.card_images[cache_key]
+            except (tk.TclError, AttributeError):
+                # print(f"Cached placeholder image for {cache_key} is invalid, regenerating.")
+                del self.card_images[cache_key]
+
+        # Ensure size is valid before generating
+        if target_size[0] <= 0 or target_size[1] <= 0:
+            # print(f"Warning: Requested invalid size {target_size} for placeholder. Using default.")
+            return self.default_placeholder # Fallback to default
+
+        # Generate PIL image for placeholder
+        img = self._create_placeholder_image(target_size)
+
+        if img is None:
+             # print(f"Warning: Failed to create PIL image for placeholder {target_size}. Using default.")
+             return self.default_placeholder # Fallback to default
+
+        # Convert PIL Image to PhotoImage
+        try:
+            photo_img = ImageTk.PhotoImage(img)
+            self.card_images[cache_key] = photo_img # Cache the generated placeholder
+            return photo_img
+        except Exception as e:
+            print(f"Error creating PhotoImage for placeholder {target_size}: {e}")
+            return self.default_placeholder # Fallback to default
+
+    def _create_rounded_rectangle(self, draw, xy, radius, fill, outline=None, width=1):
+        """
+        Draws a rounded rectangle using PIL Draw methods.
+        Handles potential issues with radius size and line width adjustments.
+
+        Args:
+            draw (ImageDraw.Draw): The PIL Draw object.
+            xy (tuple): Coordinates (x1, y1, x2, y2) of the bounding box.
+            radius (int): Corner radius.
+            fill (str): Fill color.
+            outline (str, optional): Outline color. Defaults to None.
+            width (int, optional): Outline width. Defaults to 1.
+        """
+        x1, y1, x2, y2 = xy
+        # Ensure coordinates are valid (width and height > 0)
+        if x2 <= x1 or y2 <= y1:
+            # print(f"Warning: Invalid dimensions for rounded rectangle: {xy}")
+            return
+
+        # Ensure radius is not larger than half the shortest side and non-negative
+        max_radius = min((x2 - x1) / 2, (y2 - y1) / 2)
+        radius = max(0, min(radius, max_radius)) # Clamp radius: 0 <= radius <= max_radius
+
+        # If radius is effectively zero, draw a simple rectangle
+        if radius < 0.5: # Use a small threshold instead of < 1
+            draw.rectangle(xy, fill=fill, outline=outline, width=width)
+            return
+
+        # Draw the main body rectangles (no outline here, fill only)
+        # Horizontal rectangle
+        draw.rectangle((x1 + radius, y1, x2 - radius, y2), fill=fill, outline=None)
+        # Vertical rectangle
+        draw.rectangle((x1, y1 + radius, x2, y2 - radius), fill=fill, outline=None)
+
+        # Draw the corner arcs (pieslices for fill)
+        diam = 2 * radius
+        draw.pieslice((x1, y1, x1 + diam, y1 + diam), 180, 270, fill=fill, outline=None) # Top-left
+        draw.pieslice((x2 - diam, y1, x2, y1 + diam), 270, 360, fill=fill, outline=None) # Top-right
+        draw.pieslice((x1, y2 - diam, x1 + diam, y2), 90, 180, fill=fill, outline=None)  # Bottom-left
+        draw.pieslice((x2 - diam, y2 - diam, x2, y2), 0, 90, fill=fill, outline=None)    # Bottom-right
+
+        # Draw the outline if specified
+        if outline and width > 0:
+             # Draw corner arcs for outline
+             draw.arc((x1, y1, x1 + diam, y1 + diam), 180, 270, fill=outline, width=width)
+             draw.arc((x2 - diam, y1, x2, y1 + diam), 270, 360, fill=outline, width=width)
+             draw.arc((x1, y2 - diam, x1 + diam, y2), 90, 180, fill=outline, width=width)
+             draw.arc((x2 - diam, y2 - diam, x2, y2), 0, 90, fill=outline, width=width)
+
+             # Draw straight line segments for outline
+             # Adjust coordinates slightly for better line connection with arcs if width > 1
+             adj = width / 2.0
+             draw.line([(x1 + radius, y1 + adj), (x2 - radius, y1 + adj)], fill=outline, width=width) # Top edge
+             draw.line([(x1 + radius, y2 - adj), (x2 - radius, y2 - adj)], fill=outline, width=width) # Bottom edge
+             draw.line([(x1 + adj, y1 + radius), (x1 + adj, y2 - radius)], fill=outline, width=width) # Left edge
+             draw.line([(x2 - adj, y1 + radius), (x2 - adj, y2 - radius)], fill=outline, width=width) # Right edge
+
+    def _create_placeholder_image(self, size):
+        """Creates a simple gray rounded rectangle PIL image as a placeholder."""
+        width, height = int(size[0]), int(size[1])
+        if width <= 0 or height <= 0: return None
+        img = Image.new('RGBA', (width, height), (0, 0, 0, 0)) # Transparent background
+        draw = ImageDraw.Draw(img)
+        radius = max(1, int(min(width, height) * 0.1)) # Dynamic radius
+        # Draw slightly inset to avoid border clipping
+        inset = 1
+        self._create_rounded_rectangle(draw, (inset, inset, width - 1 - inset, height - 1 - inset),
+                                       radius, fill="#555555", outline="#888888", width=1) # Dark gray fill, light gray border
+        return img
+
+    def _create_card_image(self, card_code, size):
+        """Creates a PIL image for a specific playing card face."""
+        width, height = int(size[0]), int(size[1])
+        if width <= 0 or height <= 0: return None
+
+        # --- Card Properties ---
+        rank, suit = card_code[:-1], card_code[-1]
+        symbols = {'S': '♠', 'H': '♥', 'D': '♦', 'C': '♣'}
+        colors = {'S': "#000000", 'C': "#000000", 'H': "#C14953", 'D': "#C14953"} # Black and Red
+        symbol = symbols.get(suit, '?') # Get suit symbol, default to '?'
+        color = colors.get(suit, "#000000") # Get suit color, default to black
+
+        # --- Base Image and Background ---
+        img = Image.new('RGBA', (width, height), (0, 0, 0, 0)) # Start with transparent background
+        draw = ImageDraw.Draw(img)
+        radius = max(1, int(min(width, height) * 0.1)) # Dynamic radius based on size
+        inset = 1 # Inset drawing slightly from edge
+        self._create_rounded_rectangle(draw, (inset, inset, width - 1 - inset, height - 1 - inset),
+                                       radius, fill="#FFFFFF", outline="#333333", width=1) # White fill, dark gray border
+
+        # --- Font Scaling ---
+        # Scale font sizes based on card height, with min/max limits for readability
+        rank_font_size = max(8, min(24, int(height * 0.18)))
+        suit_font_size = max(10, min(26, int(height * 0.20)))
+        center_font_size = max(15, min(60, int(height * 0.45)))
+
+        # --- Font Loading (with fallbacks) ---
+        try:
+            # Prioritize common system fonts (Arial/Helvetica/DejaVu Sans)
+            rank_font = ImageFont.truetype("arialbd.ttf", rank_font_size) # Bold for rank
+            suit_font = ImageFont.truetype("arial.ttf", suit_font_size)
+            center_font = ImageFont.truetype("arial.ttf", center_font_size)
+        except IOError:
+            try:
+                rank_font = ImageFont.truetype("DejaVuSans-Bold.ttf", rank_font_size)
+                suit_font = ImageFont.truetype("DejaVuSans.ttf", suit_font_size)
+                center_font = ImageFont.truetype("DejaVuSans.ttf", center_font_size)
+            except IOError:
+                 try:
+                     rank_font = ImageFont.truetype("HelveticaNeue-Bold.ttf", rank_font_size)
+                     suit_font = ImageFont.truetype("HelveticaNeue.ttf", suit_font_size)
+                     center_font = ImageFont.truetype("HelveticaNeue.ttf", center_font_size)
+                 except IOError:
+                    # Absolute fallback if no preferred fonts found
+                    print("Warning: Could not load preferred fonts (Arial, DejaVu Sans, Helvetica Neue). Using default.")
+                    rank_font = ImageFont.load_default()
+                    suit_font = ImageFont.load_default()
+                    center_font = ImageFont.load_default()
+
+        # --- Text Rendering ---
+        rank_text = rank if rank != 'T' else '10' # Handle 'T' for Ten
+
+        # Helper to get text dimensions using getbbox (more accurate) or fallback getsize
+        def get_text_dims(text, font):
+            try:
+                # getbbox returns (left, top, right, bottom) relative to origin
+                bbox = font.getbbox(text)
+                return bbox[2] - bbox[0], bbox[3] - bbox[1] # width, height
+            except AttributeError:
+                # Fallback for older PIL/Pillow versions
+                return font.getsize(text)
+
+        r_w, r_h = get_text_dims(rank_text, rank_font)
+        s_w, s_h = get_text_dims(symbol, suit_font)
+        c_w, c_h = get_text_dims(symbol, center_font)
+
+        # Margins (scale slightly with card size)
+        margin_x = max(3, int(width * 0.07))
+        margin_y = max(3, int(height * 0.05))
+        suit_offset_y = max(1, int(height * 0.02)) # Small vertical gap between rank and suit
+
+        # --- Draw Text Elements ---
+        # Top-left rank and suit
+        draw.text((margin_x, margin_y), rank_text, fill=color, font=rank_font)
+        draw.text((margin_x, margin_y + r_h + suit_offset_y), symbol, fill=color, font=suit_font)
+
+        # Bottom-right rank and suit (mirrored placement, text remains upright)
+        # Calculate positions carefully
+        br_rank_x = width - margin_x - r_w
+        br_rank_y = height - margin_y - r_h - s_h - suit_offset_y # Rank Y position (higher)
+        br_suit_x = width - margin_x - s_w
+        br_suit_y = height - margin_y - s_h # Suit Y position (lower)
+
+        draw.text((br_rank_x, br_rank_y), rank_text, fill=color, font=rank_font)
+        draw.text((br_suit_x, br_suit_y), symbol, fill=color, font=suit_font)
+
+        # Center symbol (adjust y slightly upwards from true center)
+        center_x = (width - c_w) / 2
+        center_y = (height - c_h) / 2 - int(height * 0.03) # Nudge up slightly
+        draw.text((center_x, center_y), symbol, fill=color, font=center_font)
+
+        return img
+
+    def _create_card_back(self, size):
+        """Creates a PIL image for the back of a playing card."""
+        width, height = int(size[0]), int(size[1])
+        if width <= 0 or height <= 0: return None
+        img = Image.new('RGBA', (width, height), (0, 0, 0, 0)) # Transparent background
+        draw = ImageDraw.Draw(img)
+        radius = max(1, int(min(width, height) * 0.1)) # Dynamic radius
+        inset = 1 # Draw slightly inset
+
+        # Main card back color and border
+        self._create_rounded_rectangle(draw, (inset, inset, width - 1 - inset, height - 1 - inset),
+                                       radius, fill="#0D5C3C", outline="#000000", width=1) # Dark Green, Black border
+
+        # --- Optional: Add a subtle pattern ---
+        # This adds visual interest but can be removed if performance is critical
+        pattern_color = "#0A4A30" # Darker green for pattern
+        try:
+            # Simple repeating pattern (e.g., small dots) within the card bounds
+            # Adjust step based on card size for consistent density
+            step = max(4, int(min(width, height) * 0.08))
+            dot_size = max(1, int(step * 0.2)) # Small dots
+
+            # Iterate within the rounded rectangle's inner area
+            for x in range(int(radius + inset + step/2), int(width - radius - inset), step):
+                for y in range(int(radius + inset + step/2), int(height - radius - inset), step):
+                    # Simple dot pattern
+                    draw.ellipse((x - dot_size // 2, y - dot_size // 2,
+                                  x + dot_size // 2 + 1, y + dot_size // 2 + 1), # +1 for inclusive coords
+                                 fill=pattern_color, outline=None)
+        except Exception as e:
+            print(f"Warning: Error drawing card back pattern: {e}") # Non-critical error
+
+        return img
+
+# --- End CardImageGenerator ---
+
 
 class PokerApp:
-    """ Main class for the Tkinter Poker Application (Tournament Adapted) """
+    """
+    Main application class for the Poker GUI.
+    Handles UI creation, game state management, and interaction with the poker environment.
+    """
     def __init__(self, root):
-        """ Initialize the application, set up variables, and create the config window. """
+        """
+        Initializes the PokerApp.
+
+        Args:
+            root (tk.Tk): The main Tkinter window.
+        """
         self.root = root
-        self.root.withdraw() # Hide the main Tkinter window initially
+        self.root.title("Enhanced Poker Game")
+        # Increased initial size slightly for better spacing on larger screens
+        self.root.geometry("1250x900")
+        self.root.minsize(1100, 750) # Minimum size to prevent layout issues
+        # Configure root window background color for a consistent look
+        self.root.configure(bg="#2E2E2E") # Dark background
 
-        # Game state variables
-        self.env = None                 # The poker environment instance
-        self.agent_model = None         # Loaded AI model (if used)
-        self.seat_configs = {}          # Dictionary mapping seat index to player type ('human', 'model', etc.)
-        self.checkpoint_path = tk.StringVar(value="checkpoints/final_agent_model.pt") # Path to AI model checkpoint
-        self.current_encoded_state = None # Last encoded state received from the environment
-        self.human_player_seat = -1     # Index of the human player's seat
-        self.action_list = []           # List of possible action strings from the env
-        self.num_actions = 0            # Number of possible actions
-        self._action_string_to_idx = {} # Mapping from action string to action index
-        self.last_info = {}             # Last info dictionary received from env.step() or env.reset()
-        self.tournament_running = False # Flag indicating if a tournament is active
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Determine device
-        print(f"Using device: {self.device}")
+        # --- Theme and Styles ---
+        self.theme = PokerTheme(root) # Initialize custom theme styles
+        # Define specific styles used in the application
+        self._configure_styles()
 
-        # UI Window references
-        self.game_window = None         # Reference to the main game Toplevel window
-        self.config_window = None       # Reference to the configuration Toplevel window
+        # --- Core Components ---
+        self.card_generator = CardImageGenerator() # For creating card images
+        self.animation_manager = AnimationManager(root) # For potential animations (not fully implemented here)
+        self.seat_config_manager = SeatConfigManager(NUM_PLAYERS) # Manages seat type configurations
 
-        # UI Widget references (organized by type)
-        self.seat_frames = {}           # Frames for each player seat area
-        self.seat_status_labels = {}    # Labels showing player type/status (e.g., "Model (BTN)")
-        self.seat_action_labels = {}    # Labels showing the last action taken by a player
-        self.seat_stack_labels = {}     # Labels showing player stack size and current bet
-        self.seat_showdown_card_labels = {} # Labels within seat frames to show cards at showdown
-        self.player_card_labels = []    # Labels for the human player's hand cards
-        self.community_card_labels = [] # Labels for the community cards on the table
-        self.pot_label = None           # Label displaying the current pot size
-        self.turn_label = None          # Label indicating whose turn it is
-        self.action_buttons = {}        # Dictionary mapping action strings to action buttons
-        self.player_hand_frame = None   # Frame containing the human player's card labels
-        self.status_bar = None          # Label at the bottom for status messages
-        self.showdown_overview_label = None # Label in the center for round results summary
-
-        # Configuration helper
-        self.seat_config_manager = SeatConfigManager(num_players=NUM_PLAYERS) # Assuming SeatConfigManager exists
-
-        # Start by showing the configuration window
-        self._create_config_window()
-
-    # --- Configuration and Setup Methods ---
-
-    def _validate_checkpoint_path(self, suffix_or_path):
-        """ Validates the checkpoint path, prepending a default directory if only a filename is given. """
-        if not suffix_or_path:
-            return None
-        # If it looks like just a filename (no directory separators)
-        if "/" not in suffix_or_path and "\\" not in suffix_or_path:
-            default_dir = "checkpoints"
-            if os.path.isdir(default_dir):
-                return os.path.join(default_dir, suffix_or_path)
-            else:
-                # If default dir doesn't exist, return the original path and let load fail later
-                print(f"Warning: Default checkpoint directory '{default_dir}' not found.")
-                return suffix_or_path
-        # Otherwise, assume it's a full or relative path
-        return suffix_or_path
-
-    # --- REMOVED _load_model function (now imported from utils) ---
-
-    def _create_config_window(self):
-        """ Creates the initial configuration window for setting up the game. """
-        if self.config_window and self.config_window.winfo_exists():
-            self.config_window.lift() # Bring existing window to front
-            return
-
-        self.config_window = tk.Toplevel(self.root)
-        self.config_window.title("Poker Game Configuration")
-        # Ensure closing this window exits the app if the game hasn't started
-        self.config_window.protocol("WM_DELETE_WINDOW", self.root.quit)
-
-        main_frame = ttk.Frame(self.config_window, padding="10")
-        main_frame.grid(row=0, column=0, sticky="nsew")
-
-        ttk.Label(main_frame, text="Configure Seats:", font="-weight bold").grid(row=0, column=0, columnspan=2, pady=(0, 10), sticky="w")
-
-        # Create dropdown menus for each seat configuration
-        self.seat_vars = []
-        options = self.seat_config_manager.get_options() # Get available types ('model', 'random', etc.)
-        # Ensure 'human' is always an option, handle potential duplicates if already in options
-        if 'human' not in options: options.insert(0, 'human')
-        else: options.remove('human'); options.insert(0, 'human') # Move to front
-
-        for i in range(NUM_PLAYERS):
-            ttk.Label(main_frame, text=f"Seat {i+1}:").grid(row=i+1, column=0, sticky=tk.W, padx=5, pady=2)
-            # Default first seat to human, others to model
-            default_val = 'human' if i == 0 else 'model'
-            if default_val not in options: default_val = options[0] # Fallback if default isn't valid
-
-            var = tk.StringVar(value=default_val)
-            # Use unique list of options for the dropdown
-            dropdown = ttk.OptionMenu(main_frame, var, default_val, *options)
-            dropdown.grid(row=i+1, column=1, sticky="ew", padx=5, pady=2)
-            self.seat_vars.append(var)
-
-        ttk.Separator(main_frame, orient=tk.HORIZONTAL).grid(row=NUM_PLAYERS + 1, column=0, columnspan=2, sticky="ew", pady=10)
-
-        # Checkpoint path entry
-        ttk.Label(main_frame, text="Model Checkpoint:").grid(row=NUM_PLAYERS + 2, column=0, sticky=tk.W, padx=5, pady=2)
-        checkpoint_entry = ttk.Entry(main_frame, textvariable=self.checkpoint_path, width=40)
-        checkpoint_entry.grid(row=NUM_PLAYERS + 2, column=1, sticky="ew", padx=5, pady=2)
-
-        # Start game button
-        start_button = ttk.Button(main_frame, text="Start Game", command=self._start_game)
-        start_button.grid(row=NUM_PLAYERS + 3, column=0, columnspan=2, pady=(15, 5))
-
-        self.config_window.resizable(False, False)
-        self.config_window.update_idletasks() # Ensure window size is calculated
-        # Center the window (optional)
-        # x = self.root.winfo_screenwidth() // 2 - self.config_window.winfo_width() // 2
-        # y = self.root.winfo_screenheight() // 2 - self.config_window.winfo_height() // 2
-        # self.config_window.geometry(f'+{x}+{y}')
-
-    def _start_game(self):
-        """ Validates configuration, initializes the environment and model, and starts the game loop. """
-        # --- ** FIX APPLIED HERE (Human ID Detection) ** ---
-        selected_types = [var.get() for var in self.seat_vars]
-
-        # Validate exactly one human player
-        human_count = selected_types.count('human')
-        if human_count == 0:
-            messagebox.showerror("Configuration Error", "No seat assigned as 'human'. Please select one seat for the human player.")
-            return
-        if human_count > 1:
-            messagebox.showerror("Configuration Error", "More than one seat assigned as 'human'. Please select only one seat for the human player.")
-            return
-
-        # Store seat configurations and find the human player's seat index
-        self.seat_configs = {}
-        self.human_player_seat = -1 # Initialize
-        for i, seat_type in enumerate(selected_types):
-            self.seat_configs[i] = seat_type # Store the config type for seat i
-            if seat_type == "human":
-                self.human_player_seat = i # Found the human player
-
-        print(f"Seat Configurations: {self.seat_configs}")
-        print(f"Human Player assigned to Seat Index: {self.human_player_seat} (Seat {self.human_player_seat + 1})")
-
-        # Safety check (should not be needed due to validation above, but good practice)
-        if self.human_player_seat == -1:
-            messagebox.showerror("Internal Error", "Failed to identify human player seat index after configuration.")
-            return
-        # --- ** END FIX ** ---
-
-        # --- Initialize Environment ---
-        try:
-            # *** MODIFICATION: Pass seat_config to environment ***
-            self.env = TrainFullPokerEnv(
-                num_players=NUM_PLAYERS,
-                agent_id=self.human_player_seat,
-                render_mode="human",
-                seat_config=self.seat_configs # Pass the configuration
-            )
-            self.action_list = self.env.action_list
-            self.num_actions = self.env.action_space.n
-            self._action_string_to_idx = {s: i for i, s in enumerate(self.action_list)}
-            print(f"Environment action list: {self.action_list}")
-
-            # Validate observation space dimension
-            if self.env.observation_space.shape[0] != STATE_DIM:
-                messagebox.showerror("Configuration Error", f"Environment observation space dimension ({self.env.observation_space.shape[0]}) does not match the expected STATE_DIM ({STATE_DIM}). Check 'utils.py' and environment definition.")
-                self.env.close()
-                self.env = None
-                return
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to create poker environment: {e}")
-            self.env = None
-            return
-
-        # --- Load AI Model (if needed) ---
-        self.agent_model = None
-        needs_model = any(stype == "model" or stype == "variable" for stype in self.seat_configs.values())
-        if needs_model:
-            checkpoint_input = self.checkpoint_path.get()
-            full_checkpoint_path = self._validate_checkpoint_path(checkpoint_input)
-
-            if not full_checkpoint_path: # Check if path is invalid/empty after validation
-                 messagebox.showerror("Configuration Error", f"Model checkpoint path is invalid or empty.")
-                 self.env.close(); self.env = None; return
-
-            # *** Use imported load_agent_model ***
-            self.agent_model = load_agent_model(full_checkpoint_path, self.num_actions, self.device)
-            if not self.agent_model:
-                # load_agent_model prints errors, just need to stop
-                self.env.close()
-                self.env = None
-                return
+        # --- Game State Variables ---
+        self.env = None # The poker environment instance
+        self.agent_model = None # Loaded AI model for default opponents
+        self.opponent_models = {} # Specific models loaded for individual seats {seat_id: model}
+        self.device = None # PyTorch device ('cpu' or 'cuda')
+        if torch: # Setup device only if torch was imported successfully
+             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+             print(f"Using device: {self.device}")
         else:
-            print("No 'model' or 'variable' opponents selected, AI model not loaded.")
+             print("PyTorch not available, running without AI model support.")
+
+        self.current_game_state = None # Stores the latest observation from the environment
+        self.human_player_id = 0 # Default seat index for the human player
+        self.seat_config = self.seat_config_manager.default_config.copy() # Current seat setup {id: type}
+        self.checkpoint_paths = {i: None for i in range(NUM_PLAYERS)} # Paths to specific AI models {id: path}
+        self.action_map = {i: s for i, s in enumerate(ACTION_LIST)} # Map action index to string
+        self.string_to_action = {s: i for i, s in enumerate(ACTION_LIST)} # Map action string to index
+        self.is_game_running = False # Flag indicating if a tournament is active
+        self.is_human_turn = False # Flag indicating if it's the human's turn to act
+        self.last_round_summary = "No previous round data." # Stores text summary of the last hand
+
+        # --- UI Widget References ---
+        # Keep references to key widgets to update them later
+        self.main_frame = None
+        self.header_frame = None
+        self.table_container = None # Frame holding the table_frame, used for centering
+        self.table_frame = None # Themed frame representing the table surface
+        self.pot_label = None
+        self.seat_positions = [] # List of dicts defining relative seat placement
+        self.seat_frames_widgets = {} # { seat_id: { 'frame': LabelFrame, 'status': Label, ... } }
+
+        # Base dimensions for player seats (used for scaling)
+        # **FIX**: Reduced base seat size slightly for better spacing
+        self.base_seat_width = 280
+        self.base_seat_height = 125
+
+        self.community_container = None # Frame holding community card labels
+        self.community_card_labels = [] # List of Labels for community cards
+        self.community_card_size = (0, 0) # Current size of community cards (updated dynamically)
+
+        self.action_panel = None # LabelFrame holding action buttons
+        self.action_buttons_frame = None # Frame inside action_panel for button layout
+        self.action_buttons = {} # { action_name: Button }
+
+        self.info_panel = None # LabelFrame for game info (round, blinds, etc.)
+        self.round_value = None # Label for current round/stage
+        self.dealer_value = None # Label for dealer button position
+        self.blinds_value = None # Label for small/big blind amounts
+        self.current_value = None # Label for the current player's turn
+        self.tocall_value = None # Label for amount needed to call
+
+        self.last_round_panel = None # LabelFrame for last round summary
+        self.last_round_summary_label = None # Label displaying the summary text
+
+        # **FIX**: Frame to hold all bottom panels, used with grid layout for centering table
+        self.bottom_panels_frame = None
+
+        self._resize_job = None # Stores ID for scheduled resize task (debouncing)
+
+        # --- Build UI ---
+        self._create_ui() # Create all the widgets
+
+        # --- Bind Resize Event ---
+        # Use add='+' to avoid overriding other potential bindings
+        self.root.bind("<Configure>", self._on_window_resize, add='+')
+
+        # --- Initial Draw and Game Setup ---
+        self.root.update_idletasks() # Ensure widgets are created and sizes known
+        self._resize_table() # Perform initial layout calculation based on window size
+        self.show_initial_message() # Setup game logic and start the first game
+        self.root.deiconify() # Show the main window (was hidden initially)
+
+    def _configure_styles(self):
+        """Configures the ttk styles used in the application."""
+        # Distinct human seat frame style
+        self.theme.style.configure(
+            'Human.Seat.TLabelframe',
+            background=self.theme.COLORS.get('bg_frame_human', self.theme.COLORS['bg_frame']), # Use specific color if defined
+            bordercolor=self.theme.COLORS['accent'], # Bright accent color
+            borderwidth=3, # Make it thicker
+            relief=tk.GROOVE
+        )
+        # Label inside the human frame (optional, if different color needed)
+        self.theme.style.configure(
+            'Human.Seat.TLabelframe.Label',
+             foreground=self.theme.COLORS.get('text_accent', self.theme.COLORS['text_primary']),
+             background=self.theme.COLORS.get('bg_frame_human', self.theme.COLORS['bg_frame'])
+        )
+
+
+        # Style for the currently active player's seat
+        self.theme.style.configure(
+            'Active.Seat.TLabelframe',
+            background=self.theme.COLORS.get('bg_frame_active', '#44475a'), # Different background
+            bordercolor=self.theme.COLORS.get('accent_active', '#ffb86c'), # Different highlight color (e.g., orange)
+            borderwidth=2,
+            relief=tk.RAISED
+        )
+        self.theme.style.configure(
+            'Active.Seat.TLabelframe.Label',
+             foreground=self.theme.COLORS.get('text_active', '#f8f8f2'), # Bright text
+             background=self.theme.COLORS.get('bg_frame_active', '#44475a')
+        )
+
+        # Styles for smaller text labels in info panels
+        self.theme.style.configure('SmallInfoText.TLabel', font=self.theme.small_font, foreground=self.theme.COLORS['text_secondary'])
+        self.theme.style.configure('SmallInfoValue.TLabel', font=self.theme.small_font, foreground=self.theme.COLORS['text_primary'])
+
+        # Add other styles as needed (e.g., for specific buttons if not covered by theme defaults)
+
+
+    def _create_ui(self):
+        """Creates the main UI structure using Tkinter widgets and grid layout."""
+        # Main Frame - takes up the whole window
+        self.main_frame = ttk.Frame(self.root, style='TFrame', padding=0)
+        # **FIX**: Use grid layout for main sections to achieve vertical centering of the table
+        self.main_frame.pack(fill=tk.BOTH, expand=True) # Pack main_frame into root
+
+        # Configure grid columns/rows for main_frame
+        self.main_frame.columnconfigure(0, weight=1) # Single column, takes all width
+        self.main_frame.rowconfigure(0, weight=0)    # Row 0: Header (fixed height)
+        self.main_frame.rowconfigure(1, weight=1)    # Row 1: Table container (expands vertically)
+        self.main_frame.rowconfigure(2, weight=0)    # Row 2: Bottom panels (fixed height)
+
+        # --- Header ---
+        self._create_header()
+        # Place header in the top row (row 0)
+        self.header_frame.grid(row=0, column=0, sticky='nsew', padx=10, pady=(5, 0))
+
+        # --- Table Area Container ---
+        # This frame's purpose is to fill the central expanding row (row 1)
+        # Its background should match the main window background
+        self.table_container = ttk.Frame(self.main_frame, style='TFrame')
+        self.table_container.grid(row=1, column=0, sticky='nsew', padx=0, pady=0)
+        # The actual table_frame will be placed *inside* this container
+
+        # --- Create Table Frame and Contents (but don't place table_frame yet) ---
+        self._create_table_area_contents()
+
+        # --- Bottom Panels Container ---
+        # **FIX**: Create a single container frame for all bottom panels
+        self.bottom_panels_frame = ttk.Frame(self.main_frame, style='TFrame')
+        self.bottom_panels_frame.grid(row=2, column=0, sticky='nsew', padx=10, pady=(0, 5))
+
+        # Create the individual bottom panels (they will be packed inside bottom_panels_frame)
+        self._create_last_round_panel()
+        self._create_game_info_panel()
+        self._create_action_panel()
+
+        # **FIX**: Pack bottom panels into their container frame using pack(side=BOTTOM)
+        # This ensures they stack vertically from the bottom edge upwards. Order matters.
+        self.action_panel.pack(side=tk.BOTTOM, fill=tk.X, pady=(2, 2), padx=0)
+        self.info_panel.pack(side=tk.BOTTOM, fill=tk.X, pady=(2, 2), padx=0)
+        self.last_round_panel.pack(side=tk.BOTTOM, fill=tk.X, pady=(2, 2), padx=0)
+
+
+    def show_initial_message(self):
+        """Called after UI creation to start the game setup process."""
+        # Currently just starts the game setup directly.
+        # Could be extended to show a welcome dialog or instructions first.
+        self.setup_game()
+
+    # --- Game Setup and Control Methods ---
+
+    def setup_game(self):
+        """
+        Initializes or resets the game environment, loads AI models based on config,
+        and prepares the UI for a new tournament.
+        """
+        print("Setting up game...")
+        print(f"Using Seat Config: {self.seat_config}")
+        print(f"Checkpoint Paths: {self.checkpoint_paths}")
+
+        self.opponent_models = {} # Clear previously loaded opponent models
+
+        # --- Model Loading Logic ---
+        # Only attempt loading if PyTorch is available
+        if torch and self.device:
+            script_dir = os.path.dirname(__file__) or "."
+            checkpoint_dir = os.path.abspath(os.path.join(script_dir, '..', 'checkpoints'))
+            print(f"Looking for checkpoints in: {checkpoint_dir}")
+
+            # Define potential paths for the primary/default AI model
+            default_checkpoint_path = os.path.join(checkpoint_dir, 'final_agent_model.pt')
+            fallback_checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint_10000.pt') # Example fallback
+
+            primary_model_path = None
+            if os.path.exists(default_checkpoint_path):
+                primary_model_path = default_checkpoint_path
+                print(f"Found default checkpoint: {primary_model_path}")
+            elif os.path.exists(fallback_checkpoint_path):
+                primary_model_path = fallback_checkpoint_path
+                print(f"Default checkpoint not found. Using fallback: {primary_model_path}")
+            else:
+                print("Warning: No default or fallback agent model found in checkpoints directory.")
+
+            # Load the primary agent model (used for opponents if no specific model is set)
+            self.agent_model = None
+            if primary_model_path:
+                try:
+                    self.agent_model = load_agent_model(primary_model_path, NUM_ACTIONS, self.device)
+                    if self.agent_model is None:
+                        messagebox.showwarning("Model Load Warning", f"Primary agent model function returned None from {primary_model_path}.")
+                    else:
+                        print("Primary agent model loaded successfully.")
+                except Exception as e:
+                     messagebox.showerror("Model Load Error", f"Error loading primary model from {primary_model_path}:\n{e}")
+                     self.agent_model = None # Ensure it's None on error
+            else:
+                 print("No primary model path found to load.")
+
+
+            # Load specific models for seats if paths are provided in self.checkpoint_paths
+            for seat_id, model_path in self.checkpoint_paths.items():
+                # Only load if it's a 'model' seat, has a valid path, and isn't the human player
+                if seat_id != self.human_player_id and self.seat_config.get(seat_id) == 'model' and model_path and os.path.exists(model_path):
+                    print(f"Loading specific model for Seat {seat_id+1} from {model_path}")
+                    try:
+                        specific_model = load_agent_model(model_path, NUM_ACTIONS, self.device)
+                        if specific_model:
+                            self.opponent_models[seat_id] = specific_model
+                            print(f"Successfully loaded specific model for Seat {seat_id+1}.")
+                        else:
+                            messagebox.showwarning("Model Load Warning", f"Specific model function returned None for Seat {seat_id+1} from {model_path}. It will use the default model or random policy.")
+                    except Exception as e:
+                        messagebox.showerror("Model Load Error", f"Error loading specific model for Seat {seat_id+1} from {model_path}:\n{e}")
+        else:
+             print("Skipping AI model loading: PyTorch not available or no device found.")
+             self.agent_model = None # Ensure models are None if torch isn't used
+
+
+        # --- Environment Initialization ---
+        try:
+            # Close previous environment cleanly if it exists
+            if hasattr(self, 'env') and self.env:
+                try:
+                     self.env.close()
+                     print("Previous environment closed.")
+                except Exception as close_err:
+                     print(f"Warning: Error closing previous environment: {close_err}")
+
+            # Create the poker environment instance
+            self.env = BaseFullPokerEnv(
+                num_players=NUM_PLAYERS,
+                agent_id=self.human_player_id, # Inform env which seat is human-controlled
+                render_mode=None, # GUI handles rendering, not the environment
+                seat_config=self.seat_config, # Pass the current seat configuration
+                starting_stack=STARTING_STACK # Pass starting stack constant
+            )
+            print("Poker Environment Initialized/Reset.")
+        except Exception as e:
+            messagebox.showerror("Fatal Error", f"Failed to initialize game environment: {e}\nCheck Back_End dependencies and constants.")
+            import traceback
+            traceback.print_exc()
+            self.root.quit()
+            return
 
         # --- Set Opponent Policies in Environment ---
-        for i in range(NUM_PLAYERS):
-            # Skip human player and empty seats
-            seat_type = self.seat_configs.get(i)
-            if i == self.human_player_seat or seat_type == 'empty':
+        # Ensure the environment instance has the necessary method
+        if not hasattr(self.env, 'set_opponent_policy'):
+             messagebox.showerror("Fatal Error", "Environment object is missing the 'set_opponent_policy' method. Cannot configure opponents.")
+             self.root.quit()
+             return
+
+        for seat_id, seat_type in self.seat_config.items():
+            # Skip configuration for human player, empty seats, or seats marked as 'player'
+            if seat_id == self.human_player_id or seat_type in ['empty', 'player']:
                 continue
 
-            # *** Use imported get_opponent_policy ***
-            policy_func = get_opponent_policy(
-                opponent_type=seat_type,
-                agent_model=self.agent_model,
-                action_list=self.action_list,
-                num_actions=self.num_actions,
-                device=self.device
-            )
+            # Determine which model to use: specific, default, or None
+            model_to_use = self.opponent_models.get(seat_id, self.agent_model)
+
+            # If seat is configured as 'model' but no model could be loaded, default policy to 'random'
+            effective_seat_type = seat_type
+            if seat_type == 'model' and model_to_use is None:
+                print(f"Warning: No model available for Seat {seat_id+1} (configured as 'model'). Setting policy to 'random'.")
+                effective_seat_type = 'random' # Override type for policy selection
+
+            # Get the policy function based on the effective type and model
             try:
-                self.env.set_opponent_policy(i, policy_func)
-                print(f"Set Seat {i+1} (Index {i}) policy to: {seat_type}")
+                policy_func = get_opponent_policy(
+                    opponent_type=effective_seat_type,
+                    agent_model=model_to_use, # Pass the loaded model (can be None)
+                    action_list=ACTION_LIST,
+                    num_actions=NUM_ACTIONS,
+                    device=self.device if torch else None # Pass device only if torch exists
+                )
+                # Assign the policy function to the environment for this seat
+                self.env.set_opponent_policy(seat_id, policy_func)
+                print(f"Set Seat {seat_id+1} policy to: {effective_seat_type}")
             except Exception as e:
-                 messagebox.showerror("Error", f"Failed to set policy for opponent at seat {i+1}: {e}")
-                 self.env.close(); self.env = None; return
+                 messagebox.showerror("Policy Error", f"Failed to get or set policy for Seat {seat_id+1} (Type: {effective_seat_type}):\n{e}")
+                 # Attempt to set a fallback 'random' policy if possible
+                 try:
+                      fallback_policy = get_opponent_policy('random', None, ACTION_LIST, NUM_ACTIONS, None)
+                      self.env.set_opponent_policy(seat_id, fallback_policy)
+                      print(f"Error setting policy for Seat {seat_id+1}. Defaulted to 'random'.")
+                 except Exception as fb_e:
+                      print(f"FATAL: Could not even set fallback random policy for Seat {seat_id+1}: {fb_e}")
+                      # Consider stopping the game here as configuration failed critically
+                      messagebox.showerror("Fatal Error", "Failed to set even fallback policies. Exiting.")
+                      self.root.quit()
+                      return
+
+        # --- Reset UI and Start Game ---
+        self.update_last_round_display("New tournament started.") # Update summary label
+        self._clear_table_state() # Reset visual elements (cards, highlights, etc.)
+
+        # Start the first round after a short delay to allow UI to draw/update
+        self.root.after(200, self.start_new_tournament)
 
 
-        # --- Transition to Game Window ---
-        if self.config_window:
-            self.config_window.destroy()
-            self.config_window = None
+    def _clear_table_state(self):
+        """Resets visual elements like cards, highlights, bets to a default state."""
+        print("Clearing table state visuals...")
+        if not self.root.winfo_exists(): return # Don't update if window closed
 
-        self._create_game_window() # Build the main game UI
-        self.tournament_running = True
-        if self.status_bar: self.status_bar.config(text="Starting new tournament...")
-
-        # --- Reset Environment and Start Game Loop ---
         try:
-            # Reset the environment to get the initial state and info
-            # Env reset now uses the seat_config passed during init
-            self.current_encoded_state, self.last_info = self.env.reset()
-            # Check for immediate errors after reset
-            if isinstance(self.last_info, dict) and self.last_info.get("error"):
-                messagebox.showerror("Error", f"Environment reset failed: {self.last_info['error']}")
-                self._reconfigure() # Go back to config screen
+            self.update_pot(0)
+            self.update_community_cards([]) # Clear community cards
+
+            for i in range(NUM_PLAYERS):
+                 # Reset player status, stack display, and action text
+                 # Determine initial status based on config
+                 seat_type = self.seat_config.get(i, "Unknown")
+                 status_text = "Empty"
+                 if seat_type != 'empty':
+                      status_text = "Human" if i == self.human_player_id else seat_type.capitalize()
+                 self.update_player_status(i, status_text, STARTING_STACK, "Last: - | Bet: $0")
+
+                 self.update_player_cards(i, ["??", "??"]) # Reset cards to hidden
+
+                 # Reset seat frame style (remove active highlight, ensure human style)
+                 widgets = self.seat_frames_widgets.get(i)
+                 if widgets and widgets['frame'].winfo_exists():
+                     style = 'Human.Seat.TLabelframe' if i == self.human_player_id else 'Seat.TLabelframe'
+                     widgets['frame'].configure(style=style)
+
+            self.highlight_active_player(None) # Ensure no player is highlighted initially
+
+            # Reset game info panel to defaults
+            self.update_game_info("Waiting...", "-", 0, 0, "-", 0)
+            # Disable action buttons
+            self.update_action_buttons(False)
+        except tk.TclError as e:
+             print(f"Warning: TclError during UI clear ({e}). Window might be closing.")
+        except Exception as e:
+             print(f"Error during UI clear: {e}")
+
+
+    def start_new_tournament(self):
+        """Starts a new tournament by resetting the environment and processing the initial state."""
+        if not self.env:
+            messagebox.showerror("Error", "Game environment not initialized. Cannot start tournament.")
+            return
+
+        print("\n--- Starting New Tournament ---")
+        self.is_game_running = True # Set flag indicating game is active
+        try:
+            # Reset the environment to get the initial state (observation) and info dictionary
+            # A seed could be passed here for reproducibility: self.env.reset(seed=...)
+            encoded_state, info = self.env.reset()
+
+            # Check for critical errors reported by the environment during reset
+            if info.get("error"):
+                messagebox.showerror("Environment Error", f"Failed to start new tournament:\n{info['error']}")
+                self.is_game_running = False
                 return
 
-            self._update_ui() # Update UI with initial state
-            # Schedule the first game turn processing
-            self.root.after(100, self._process_game_turn)
+            self.current_game_state = encoded_state # Store the initial observation
+
+            # Update the summary display (redundant with _clear_table_state, but safe)
+            self.update_last_round_display("New tournament started.")
+
+            # Perform a full UI update based on the initial state from the info dictionary
+            self.update_ui_from_info(info) # This sets player cards, stacks, pot, etc.
+
+            # Process the first game step based on the initial info
+            # This will determine whose turn it is (human or opponent) and proceed accordingly
+            self.process_game_step(info)
+
+        except AttributeError as ae:
+             # Catch errors like calling reset on None if env failed to initialize
+             if "'NoneType' object has no attribute 'reset'" in str(ae):
+                 messagebox.showerror("Error", "Game environment (self.env) is not properly initialized.")
+             else:
+                 messagebox.showerror("Error", f"An unexpected attribute error occurred starting the tournament: {ae}")
+             self.is_game_running = False
+             import traceback
+             traceback.print_exc()
         except Exception as e:
-            messagebox.showerror("Error", f"Failed during initial environment reset: {e}")
-            self._reconfigure() # Go back to config if reset fails
-
-    def _create_game_window(self):
-        """ Creates the main game window with all UI elements. """
-        if self.game_window and self.game_window.winfo_exists():
-            self.game_window.lift() # Bring existing window to front
-            return
-
-        self.game_window = tk.Toplevel(self.root)
-        self.game_window.title("Poker Game (Tournament Mode)")
-        self.game_window.geometry("950x800") # Adjust size as needed
-        self.game_window.protocol("WM_DELETE_WINDOW", self.root.quit) # Closing game exits app
-
-        # --- Styling ---
-        style = ttk.Style()
-        try:
-            # Attempt to use a specific theme
-            style.theme_use('clam') # Or 'alt', 'default', 'classic'
-        except tk.TclError:
-            print("Note: 'clam' theme not available, using default.")
-
-        try:
-            # Configure custom styles for different labels
-            style.configure("Card.TLabel", font=MONOSPACE_FONT, padding=2, anchor="center", justify="center", borderwidth=1, relief="solid")
-            style.configure("PlayerHand.TLabel", font=(MONOSPACE_FONT[0], 12, "bold"), padding=3, anchor="center", justify="center", borderwidth=2, relief="solid")
-            style.configure("Showdown.TLabel", font=MONOSPACE_FONT, padding=1, anchor="nw", justify="left", foreground="darkblue") # For cards shown under seats
-            style.configure("Overview.TLabel", padding=(5, 3), anchor="nw", justify="left", foreground="black", background="#f0f0f0", relief="groove", borderwidth=1) # For round summary
-            style.configure("Bold.TLabel", font="-weight bold")
-            style.configure("Turn.TLabel", font=("", 12, "bold")) # Style for the turn indicator
-            style.configure("Pot.TLabel", font=("", 12, "bold")) # Style for the pot label
-            # Style for empty seat labels
-            style.configure("Empty.TLabel", foreground=EMPTY_SEAT_COLOR)
-
-        except tk.TclError as e:
-            print(f"Warning: Failed to set custom font '{MONOSPACE_FONT}'. Using default styles. Error: {e}")
-            # Provide basic fallbacks if font fails
-            style.configure("Card.TLabel", padding=2, anchor="center", justify="center", borderwidth=1, relief="solid")
-            style.configure("PlayerHand.TLabel", font="-size 12 -weight bold", padding=3, anchor="center", justify="center", borderwidth=2, relief="solid")
-            style.configure("Showdown.TLabel", padding=1, anchor="nw", justify="left", foreground="darkblue")
-            style.configure("Overview.TLabel", padding=(5, 3), anchor="nw", justify="left", foreground="black", background="#f0f0f0", relief="groove", borderwidth=1)
-            style.configure("Bold.TLabel", font="-weight bold")
-            style.configure("Turn.TLabel", font="-size 12 -weight bold")
-            style.configure("Pot.TLabel", font="-size 12 -weight bold")
-            style.configure("Empty.TLabel", foreground=EMPTY_SEAT_COLOR)
-
-
-        # --- Main Layout Frames ---
-        top_frame = ttk.Frame(self.game_window, padding=5)
-        top_frame.pack(fill=tk.X, side=tk.TOP)
-
-        middle_frame = ttk.Frame(self.game_window, padding=10)
-        middle_frame.pack(fill=tk.BOTH, expand=True)
-
-        bottom_frame = ttk.Frame(self.game_window, padding=10)
-        bottom_frame.pack(fill=tk.X, side=tk.BOTTOM)
-
-        # --- Top Frame Content (Turn Indicator) ---
-        self.turn_label = ttk.Label(top_frame, text="Turn: -", style="Turn.TLabel", foreground="black")
-        self.turn_label.pack(side=tk.LEFT, padx=20, pady=5)
-
-        # --- Middle Frame Content (Seats and Table) ---
-        # Create frames for left seats, center table, and right seats
-        left_seats_frame = ttk.Frame(middle_frame, padding=5)
-        left_seats_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10), anchor='n')
-
-        table_frame = ttk.Frame(middle_frame, padding=10) # Center area
-        table_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, anchor='center')
-
-        right_seats_frame = ttk.Frame(middle_frame, padding=5)
-        right_seats_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0), anchor='n')
-
-        # Create individual seat frames and labels
-        self.seat_frames = {}
-        self.seat_status_labels = {}
-        self.seat_action_labels = {}
-        self.seat_stack_labels = {}
-        self.seat_showdown_card_labels = {}
-        seat_width = 170 # Adjust width as needed
-        # --- MODIFICATION: Increased seat height ---
-        seat_height = 140 # Increased from 110 to make boxes taller
-
-        for i in range(NUM_PLAYERS):
-            # Determine parent frame (left or right)
-            parent_frame = left_seats_frame if i < (NUM_PLAYERS / 2) else right_seats_frame
-
-            # Create the main frame for the seat
-            seat_frame = ttk.LabelFrame(parent_frame, text=f"Seat {i+1}", padding=10, width=seat_width, height=seat_height)
-            seat_frame.pack(pady=5, fill=tk.X, anchor='n')
-            seat_frame.pack_propagate(False) # Prevent frame from shrinking to content
-            self.seat_frames[i] = seat_frame
-
-            # Create labels within the seat frame
-            status_label = ttk.Label(seat_frame, text="Status: -", wraplength=seat_width-20)
-            status_label.pack(anchor=tk.NW, fill=tk.X)
-            self.seat_status_labels[i] = status_label
-
-            stack_label = ttk.Label(seat_frame, text="Stack: $0")
-            stack_label.pack(anchor=tk.NW, fill=tk.X)
-            self.seat_stack_labels[i] = stack_label
-
-            action_label = ttk.Label(seat_frame, text="Last Action: -", foreground="gray", wraplength=seat_width-20)
-            action_label.pack(anchor=tk.NW, fill=tk.X)
-            self.seat_action_labels[i] = action_label
-
-            # Label specifically for showing cards at showdown (initially empty)
-            # Increased height allows more space for this label
-            showdown_label = ttk.Label(seat_frame, text="", style="Showdown.TLabel", justify="left", wraplength=seat_width-20)
-            showdown_label.pack(anchor=tk.NW, pady=(5,0), fill=tk.X, expand=True) # Allow vertical expansion
-            self.seat_showdown_card_labels[i] = showdown_label
-
-        # --- Center Table Elements (Community Cards, Player Hand, Pot) ---
-        community_frame = ttk.LabelFrame(table_frame, text="Community Cards", padding=10)
-        community_frame.pack(pady=10, anchor='center')
-        self.community_card_labels = []
-        for _ in range(5): # 5 community cards max
-            lbl = ttk.Label(community_frame, text=" ", style="Card.TLabel", width=7, anchor="center")
-            lbl.pack(side=tk.LEFT, padx=3)
-            self.community_card_labels.append(lbl)
-
-        # Player Hand Frame (for human player)
-        self.player_hand_frame = ttk.LabelFrame(table_frame, text="Your Hand (Seat ?)", padding=10)
-        self.player_hand_frame.pack(pady=10, anchor='center')
-        self.player_card_labels = []
-        for _ in range(2): # 2 hole cards
-            lbl = ttk.Label(self.player_hand_frame, text=" ", style="PlayerHand.TLabel", width=7, anchor="center")
-            lbl.pack(side=tk.LEFT, padx=5)
-            self.player_card_labels.append(lbl)
-
-        # Pot Label
-        self.pot_label = ttk.Label(table_frame, text="Pot: $0", style="Pot.TLabel")
-        self.pot_label.pack(pady=(10, 5), anchor='center')
-
-        # Showdown Overview Label (for winner summary)
-        self.showdown_overview_label = ttk.Label(table_frame, text="", style="Overview.TLabel", wraplength=450, justify="left")
-        self.showdown_overview_label.pack(pady=(5,10), fill=tk.X, anchor='center', expand=False) # Don't expand vertically
-
-        # --- Bottom Frame Content (Action Buttons, Controls, Status Bar) ---
-        action_frame = ttk.Frame(bottom_frame)
-        action_frame.pack(pady=(0,10)) # Pack action buttons first
-
-        self.action_buttons = {}
-        # Use action_list from env if available, otherwise default
-        button_actions = self.action_list if self.action_list else ['fold', 'call', 'check', 'bet_small', 'bet_big', 'all_in']
-        # Define a consistent order for buttons
-        action_order = ['fold', 'check', 'call', 'bet_small', 'bet_big', 'all_in']
-        display_actions = [a for a in action_order if a in button_actions]
-
-        for action in display_actions:
-            btn_text = action.replace('_', ' ').title() # Format text (e.g., 'bet_small' -> 'Bet Small')
-            btn = ttk.Button(action_frame, text=btn_text, width=10, state=tk.DISABLED,
-                             command=lambda a=action: self._handle_human_action(a))
-            btn.pack(side=tk.LEFT, padx=5)
-            self.action_buttons[action] = btn
-
-        # Control buttons (New Game, Exit)
-        control_frame = ttk.Frame(bottom_frame)
-        control_frame.pack(pady=(5,0))
-
-        reconfig_button = ttk.Button(control_frame, text="New Game / Reconfigure", command=self._reconfigure)
-        reconfig_button.pack(side=tk.LEFT, padx=10)
-
-        exit_button = ttk.Button(control_frame, text="Exit Application", command=self.root.quit)
-        exit_button.pack(side=tk.LEFT, padx=10)
-
-        # Status Bar
-        self.status_bar = ttk.Label(bottom_frame, text="Welcome! Configure seats and start the game.", relief=tk.SUNKEN, anchor=tk.W, padding=2)
-        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(10,0)) # Pack status bar last at the bottom
-
-    # --- Game Flow Logic ---
-
-    def _process_game_turn(self):
-        """ Checks whose turn it is and either enables human actions or triggers AI action. """
-        if not self.env or not self.tournament_running:
-            # print("Debug: Process game turn called but env/tournament not ready.") # Reduced verbosity
-            return
-
-        # Check if the tournament ended in the environment's state
-        # Use last_info as env state might not be updated yet if tournament ended in last step
-        if self.last_info.get('terminated', False) or self.last_info.get('truncated', False) or \
-           (hasattr(self.env, 'tournament_over') and self.env.tournament_over):
-            print("Debug: Tournament detected as over during turn processing.")
-            # Ensure UI update happens before potential blocking message box
-            # Pass the *last* info dict received from the step that ended the tournament
-            self.root.after(50, lambda info=self.last_info: self._handle_tournament_end(info))
-            return
-
-        # Get current player ID from the environment
-        current_player_id = None
-        try:
-            # Added try-except in case env state is unstable
-            current_player_id = self.env.current_player_id if hasattr(self.env, 'current_player_id') else None
-        except Exception as e:
-            print(f"Error accessing env.current_player_id: {e}")
-            # Potentially handle error state, e.g., reconfigure
-            self.root.after(50, self._reconfigure)
-            return
-
-
-        # Update turn indicator label and highlight active player frame
-        if current_player_id is not None and self.seat_configs.get(current_player_id) != 'empty':
-            is_human_turn = (current_player_id == self.human_player_seat)
-            seat_type_str = self.seat_configs.get(current_player_id, '?').title()
-            turn_text = f"Turn: Seat {current_player_id + 1}" + (" (You)" if is_human_turn else f" ({seat_type_str})")
-            fg_color = "blue" if is_human_turn else "black"
-            if self.turn_label.winfo_exists(): self.turn_label.config(text=turn_text, foreground=fg_color)
-
-            # Highlight the active player's frame
-            for i, frame in self.seat_frames.items():
-                 if frame.winfo_exists():
-                     # Only highlight if not empty
-                     is_current = (i == current_player_id and self.seat_configs.get(i) != 'empty')
-                     frame.config(relief="sunken" if is_current else ("flat" if self.seat_configs.get(i) == 'empty' else "groove"))
-        else:
-            # Handle case where current_player_id is None or points to an empty seat
-            if self.turn_label.winfo_exists(): self.turn_label.config(text="Turn: -", foreground="black")
-            for i, frame in self.seat_frames.items():
-                 if frame.winfo_exists():
-                     frame.config(relief="flat" if self.seat_configs.get(i) == 'empty' else "groove")
-
-
-        # Check if it's the human player's turn
-        if current_player_id == self.human_player_seat:
-            if self.status_bar.winfo_exists(): self.status_bar.config(text="Your turn. Choose an action.")
-            try:
-                # Get legal actions specifically for the human agent
-                legal_actions = self.env.get_legal_actions_for_agent()
-                # print(f"Debug: Human legal actions: {legal_actions}") # Reduced verbosity
-
-                # *** Add check for no legal actions when it's human turn (e.g., after fold) ***
-                if not legal_actions:
-                     print("Debug: Human turn, but no legal actions found. Triggering step.")
-                     # Treat as if current_player_id was None to advance state
-                     current_player_id = None # Force into the 'else' block below
-                     # Fall through to the else block...
-                else:
-                     # Enable corresponding buttons
-                     for action, button in self.action_buttons.items():
-                          if button.winfo_exists():
-                              button.config(state=tk.NORMAL if action in legal_actions else tk.DISABLED)
-
-            except AttributeError:
-                 print("Error: Environment does not have 'get_legal_actions_for_agent' method.")
-                 messagebox.showerror("Error", "Environment is missing the required 'get_legal_actions_for_agent' method.")
-                 for button in self.action_buttons.values():
-                      if button.winfo_exists(): button.config(state=tk.DISABLED) # Disable all
-            except Exception as e:
-                print(f"Error getting legal actions for human: {e}")
-                messagebox.showerror("Error", f"Could not get legal actions: {e}")
-                for button in self.action_buttons.values():
-                     if button.winfo_exists(): button.config(state=tk.DISABLED) # Disable all
-
-        # Check AI turn *after* potential modification of current_player_id above
-        if current_player_id is not None and current_player_id != self.human_player_seat and self.seat_configs.get(current_player_id) != 'empty': # It's an AI player's turn
-            if self.status_bar.winfo_exists(): self.status_bar.config(text=f"Waiting for Seat {current_player_id + 1}...")
-            # Disable all human action buttons
-            for button in self.action_buttons.values():
-                 if button.winfo_exists(): button.config(state=tk.DISABLED)
-
-            # Schedule the AI action after a short delay (for visual feedback)
-            ai_delay = 300 # milliseconds
-            self.root.after(ai_delay, self._handle_ai_action)
-
-        elif current_player_id is None: # Covers case where it was None initially, or set to None above
-             # current_player_id is None (between rounds or end)
-             print("Debug: current_player_id is None. Triggering step for potential new round start.")
-             if self.status_bar.winfo_exists(): self.status_bar.config(text="Starting next round...")
-             # Disable buttons while processing
-             for button in self.action_buttons.values():
-                  if button.winfo_exists(): button.config(state=tk.DISABLED)
-             # Call _step_env to let env handle the round transition
-             self.root.after(100, lambda: self._step_env(-1)) # Short delay
-
-        elif self.seat_configs.get(current_player_id) == 'empty': # Points to empty seat
-             # Env should handle skipping, trigger next step processing via AI handler path
-             print(f"Debug: Current player {current_player_id} is empty seat. Triggering step.")
-             # Use handle_ai_action which calls _step_env(-1)
-             self.root.after(50, self._handle_ai_action)
-
-
-    def _handle_ai_action(self):
-        """ Triggers the environment to process the AI opponent's turn. """
-        # Initial guard clause
-        if not self.tournament_running or not hasattr(self.env, 'current_player_id'):
-            print("Debug: AI action handler called but tournament stopped or env invalid.")
-            return
-
-        # Get current player ID
-        current_player_id = None
-        try:
-             current_player_id = self.env.current_player_id
-        except Exception as e:
-             print(f"Error accessing env.current_player_id in _handle_ai_action: {e}")
-             self.root.after(50, self._reconfigure) # Go to config on error
-             return
-
-        if current_player_id is None:
-            print("Warning: _handle_ai_action called when current_player_id is None. Skipping AI step.")
-            # If ID is None, _process_game_turn should handle triggering the next step.
-            # Avoid calling _step_env directly here if ID is None.
-            return
-
-        if current_player_id == self.human_player_seat:
-            print("Debug: AI action handler called but it's human's turn. Skipping.")
-            return
-
-        # Skip AI action if seat is empty and trigger next step
-        if self.seat_configs.get(current_player_id) == 'empty':
-             print(f"Debug: Skipping AI action for empty Seat {current_player_id + 1}")
-             # Call _step_env with dummy action to advance past empty seat
-             self._step_env(-1)
-             return
-
-
-        print(f"Debug: Handling AI action for Seat {current_player_id + 1}")
-        # The environment's step function handles getting the action from the opponent's policy when action=-1
-        self._step_env(-1) # Use -1 to signal the env should use the internal policy for the current player
-
-    def _handle_human_action(self, action_str):
-        """ Handles the button press for a human player's action. """
-        current_player_id = self.env.current_player_id if hasattr(self.env, 'current_player_id') else None
-        # Verify it's actually the human's turn
-        if not self.env or not self.tournament_running or current_player_id != self.human_player_seat:
-            print(f"Warning: Human action '{action_str}' received, but it's not the human's turn (Current: {current_player_id}).")
-            return
-
-        print(f"Human (Seat {self.human_player_seat + 1}) chose action: {action_str}")
-
-        # Convert action string to the index the environment expects
-        action_idx = self._action_string_to_idx.get(action_str, -1)
-        if action_idx == -1:
-            messagebox.showerror("Internal Error", f"Invalid action mapping for '{action_str}'. Cannot proceed.")
-            return
-
-        # Disable buttons immediately to prevent double-clicks
-        for btn in self.action_buttons.values():
-            if btn.winfo_exists(): btn.config(state=tk.DISABLED)
-
-        if self.status_bar.winfo_exists(): self.status_bar.config(text=f"You chose '{action_str}'. Processing...")
-        self.root.update_idletasks() # Force UI update
-
-        # Step the environment with the chosen action index
-        self._step_env(action_idx)
-
-    def _step_env(self, action_idx):
-        """ Steps the environment with the given action index and handles the result. """
-        if not self.tournament_running or not self.env:
-            print("Debug: Step env called but tournament/env not running.")
-            return
-
-        try:
-            # Perform the step in the environment
-            # Action_idx is the integer index for human, or -1 for AI (env uses its policy)
-            next_encoded_state, reward, terminated, truncated, info = self.env.step(action_idx)
-
-            # Store the results
-            self.current_encoded_state = next_encoded_state
-            self.last_info = info if isinstance(info, dict) else {} # Ensure info is a dict
-            # Store terminated/truncated flags in last_info for checks in _process_game_turn
-            self.last_info['terminated'] = terminated
-            self.last_info['truncated'] = truncated
-            done = terminated or truncated # Check if episode/round/tournament ended
-
-            # --- Log key info ---
-            last_action_info = info.get('last_action', {})
-            # Find the player ID from the keys of last_action_info if it exists
-            last_player_id = next(iter(last_action_info.keys())) if last_action_info else None
-            last_action_str = last_action_info.get(last_player_id, "N/A") if last_player_id is not None else "N/A"
-            # print(f"Debug: env.step result - Reward: {reward}, Done: {done}, Stage: {info.get('stage', 'N/A')}, Last Action ({last_player_id}): {last_action_str}") # Reduced verbosity
-            if 'error' in info: print(f"ERROR in env info: {info['error']}")
-
-            # --- Update UI based on new state ---
-            self._update_ui() # Update stacks, cards, pot, etc.
-
-            # --- Handle Round End ---
-            round_over = info.get('round_over', False)
-            delay_ms = 200 # Default delay before next turn/action
-
-            if round_over:
-                print("Debug: Round detected as over.")
-                self._display_round_results(info) # Show winner, hands, etc.
-                delay_ms = 2000 # Longer pause after showing round results
-
-            # --- Handle Tournament End or Continue ---
-            if done:
-                print(f"Debug: Game is done (Terminated: {terminated}, Truncated: {truncated}). Handling tournament end.")
-                # Use root.after to ensure UI updates before blocking with message box
-                # Pass the info dict from the step that ended the game
-                self.root.after(100, lambda info_end=info: self._handle_tournament_end(info_end))
-            else:
-                # Schedule the next turn processing after the delay
-                self.root.after(delay_ms, self._process_game_turn)
-
-        except Exception as e:
-            # Catch errors during the environment step
-            print(f"CRITICAL ERROR during env.step(): {e}")
+            messagebox.showerror("Error", f"An unexpected error occurred starting the tournament: {e}")
+            self.is_game_running = False
             import traceback
-            traceback.print_exc() # Print detailed traceback
-            messagebox.showerror("Environment Error", f"A critical error occurred during game progression:\n{e}\n\nReturning to configuration.")
-            self.tournament_running = False
-            # Use root.after to avoid issues if error occurs during tk callback
-            self.root.after(50, self._reconfigure)
+            traceback.print_exc()
 
-    # --- UI Update and Display Methods ---
 
-    def _update_ui(self):
-        """ Updates all UI elements based on the latest `self.last_info` dictionary. """
-        if not self.game_window or not self.game_window.winfo_exists() or not self.env or not self.last_info:
-            # print("Debug: Update UI skipped - window/env/info not ready.")
+    def update_ui_from_info(self, info):
+        """
+        Updates the entire UI based on the info dictionary received from the environment step/reset.
+        This is the central function for synchronizing the GUI with the game state.
+        """
+        if not self.root.winfo_exists(): return # Stop if window is closed
+        if not info or not isinstance(info, dict):
+            print("Warning: update_ui_from_info received invalid info object.")
             return
 
-        # Extract relevant information from the last_info dictionary
-        stacks = self.last_info.get('stacks', {})
-        pot = self.last_info.get('pot', 0)
-        community_cards = self.last_info.get('community_cards', [])
-        active_players = self.last_info.get('active_players', []) # Players still in the current hand
-        # Get active players who are all-in (need to check stack == 0)
-        all_in_players = [p for p in active_players if stacks.get(p, 0) == 0]
-        # Folded players might not be in active_players, need separate tracking if env provides it
-        # Assuming env doesn't explicitly track folded, derive from !active_players and stack > 0? Risky.
-        # Let's rely on active_players and all_in_players for status for now.
-        current_bets = self.last_info.get('current_bets', {}) # Bets in the current street
-        last_actions = self.last_info.get('last_action', {}) # Map player_id -> last action string
-        button_pos = self.last_info.get('button_pos', -1) # Dealer button position
-        current_stage = self.last_info.get('stage', 'Unknown') # e.g., 'preflop', 'flop', 'turn', 'river'
+        # --- Extract data from info dictionary with safe defaults ---
+        pot = info.get('pot', 0)
+        community_cards = info.get('community_cards', [])
+        stacks = info.get('stacks', {p: 0 for p in range(NUM_PLAYERS)})
+        current_bets = info.get('current_bets', {}) # Bets in the current betting round
+        active_players_in_round = info.get('active_players', []) # Still eligible to win pot
+        folded_players = info.get('folded_players', []) # Folded this hand
+        all_in_players = info.get('all_in_players', []) # All-in this hand
+        showdown_hands = info.get('showdown_hands') # {player_id: {'hand': [], 'desc': ''}} or None
+        agent_hand = info.get('agent_hand') # Try to get human hand directly from info first
 
-        # Get human player's hand (might be empty if player folded or not dealt yet)
-        human_hand = []
-        if self.human_player_seat != -1:
-             try:
-                 # Use a method assumed to exist in the env
-                 human_hand = self.env.get_player_hand(self.human_player_seat)
-             except AttributeError:
-                 print("Warning: env does not have get_player_hand method.")
-             except Exception as e:
-                 print(f"Error getting human hand: {e}")
+        # Fallback: if info doesn't provide agent_hand, try getting from env (less reliable during transitions)
+        if agent_hand is None and hasattr(self.env, 'hands') and isinstance(self.env.hands, dict):
+             agent_hand = self.env.hands.get(self.human_player_id)
 
-        # --- Update Center Table ---
-        # Pot Label
-        if self.pot_label and self.pot_label.winfo_exists():
-            self.pot_label.config(text=f"Pot: ${pot:.2f}")
+        is_round_over = info.get('round_over', False)
+        is_terminated = info.get('terminated', False) # Tournament finished
+        current_player_id = info.get('current_player_id') # Whose turn? (can be None)
+        button_pos = info.get('button_pos', -1) # Dealer button seat index
+        last_action_data = info.get('last_action', {}) # {player_id: action_str}
 
-        # *** DEBUGGING PRINT STATEMENT ADDED HERE ***
-        # This will print the list of community cards the UI received from the environment's info dictionary.
-        # Compare this output in your console to what you expect to see on the board.
-        # print(f"DEBUG: Updating UI - Community Cards received: {community_cards}") # Keep for debugging if needed
+        # --- Update Central Table Elements ---
+        try:
+            self.update_pot(pot)
+            self.update_community_cards(community_cards)
+        except tk.TclError: return # Stop updates if UI is being destroyed
 
-        # Community Cards
-        rendered_community = render_community_cards_for_labels(community_cards) # Util function formats cards
-        for i, label in enumerate(self.community_card_labels):
-            if label.winfo_exists():
-                label.config(text=rendered_community[i]) # Update label text
-
-        # Player Hand (Human)
-        if self.human_player_seat != -1 and self.seat_configs.get(self.human_player_seat) != 'empty':
-            if self.player_hand_frame.winfo_exists():
-                self.player_hand_frame.config(text=f"Your Hand (Seat {self.human_player_seat + 1}) - {current_stage.title()}")
-            rendered_hand = render_hand_for_labels(human_hand) # Util function formats cards
-            for i, label in enumerate(self.player_card_labels):
-                if label.winfo_exists():
-                    label.config(text=rendered_hand[i])
-        elif self.player_hand_frame.winfo_exists(): # Hide if human seat is empty
-             self.player_hand_frame.config(text="Player Hand") # Reset title
-             for label in self.player_card_labels:
-                  if label.winfo_exists(): label.config(text="")
-
-
-        # Clear showdown labels if the round is NOT over
-        round_just_ended = self.last_info.get('round_over', False)
-        if not round_just_ended:
-            # Clear individual showdown labels under each seat
-            for i in range(NUM_PLAYERS):
-                if i in self.seat_showdown_card_labels and self.seat_showdown_card_labels[i].winfo_exists():
-                    self.seat_showdown_card_labels[i].config(text="") # Clear text
-            # Clear the central overview label
-            if self.showdown_overview_label and self.showdown_overview_label.winfo_exists():
-                self.showdown_overview_label.config(text="")
-
-        # --- Update Seat Information ---
+        # --- Update Each Player Seat ---
         for i in range(NUM_PLAYERS):
-            # Skip if seat frame doesn't exist (shouldn't happen)
-            if i not in self.seat_frames or not self.seat_frames[i].winfo_exists():
-                continue
+            if not self.root.winfo_exists(): return # Check again inside loop
 
-            seat_type = self.seat_configs.get(i, 'N/A') # Get original type ('empty', 'model', etc.)
-            stack = stacks.get(i, 0)
-            current_bet = current_bets.get(i, 0)
+            try:
+                # Get Seat Info
+                stack = stacks.get(i, 0)
+                seat_type = self.seat_config.get(i, "Unknown")
+                is_playing_tournament = seat_type != 'empty'
+                is_active_in_hand = i in active_players_in_round
+                is_folded = i in folded_players
+                is_all_in = i in all_in_players
+                bet_this_round = current_bets.get(i, 0)
 
-            # Check if seat is empty and update display accordingly
-            if seat_type == 'empty':
-                 if i in self.seat_status_labels: self.seat_status_labels[i].config(text="--- EMPTY ---", style="Empty.TLabel")
-                 if i in self.seat_stack_labels: self.seat_stack_labels[i].config(text="", style="Empty.TLabel")
-                 if i in self.seat_action_labels: self.seat_action_labels[i].config(text="", style="Empty.TLabel")
-                 if i in self.seat_showdown_card_labels: self.seat_showdown_card_labels[i].config(text="", style="Empty.TLabel")
-                 self.seat_frames[i].config(relief="flat") # Make empty seats less prominent
-                 continue # Skip rest of update for empty seat
-
-            # --- Update for Non-Empty Seats ---
-            # Reset style in case it was empty before
-            if i in self.seat_status_labels: self.seat_status_labels[i].config(style="TLabel")
-            if i in self.seat_stack_labels: self.seat_stack_labels[i].config(style="TLabel")
-            if i in self.seat_action_labels: self.seat_action_labels[i].config(style="TLabel", foreground="gray") # Reset color
-            if i in self.seat_showdown_card_labels: self.seat_showdown_card_labels[i].config(style="Showdown.TLabel")
-            # Reset relief based on whose turn it is (handled in _process_game_turn)
-            # self.seat_frames[i].config(relief="groove") # Reset relief
-
-
-            # Determine player status text
-            status_text = f"Type: {seat_type.title()}"
-            player_status = ""
-            is_player_active_in_hand = i in active_players # Still eligible to win pot
-            has_stack = stack > 0
-
-            if i == self.human_player_seat: status_text += " (You)"
-            if i == button_pos: status_text += " (BTN)"
-
-            # Refined Status Check
-            if not has_stack: player_status = " (Out)"
-            elif i in all_in_players: player_status = " (All-In)"
-            elif not is_player_active_in_hand and current_stage != 'prehand' and current_stage != 'showdown':
-                 # If hand is in progress, they have chips, but aren't active -> Folded
-                 player_status = " (Folded)"
-
-
-            # Update Status Label
-            if i in self.seat_status_labels and self.seat_status_labels[i].winfo_exists():
-                self.seat_status_labels[i].config(text=status_text + player_status)
-
-            # Update Stack and Bet Label
-            stack_bet_text = f"Stack: ${stack:.2f}"
-            if current_bet > 0:
-                stack_bet_text += f" (Bet: ${current_bet:.2f})"
-            if i in self.seat_stack_labels and self.seat_stack_labels[i].winfo_exists():
-                self.seat_stack_labels[i].config(text=stack_bet_text)
-
-            # Update Last Action Label
-            if i in self.seat_action_labels and self.seat_action_labels[i].winfo_exists():
-                action_str = last_actions.get(i, "-")
-                # Only show action if player acted this round or is involved
-                if action_str != "-":
-                     self.seat_action_labels[i].config(text=f"Last Action: {action_str.replace('_', ' ').title()}", foreground="black")
+                # Determine Player Status String
+                status_parts = []
+                if not is_playing_tournament:
+                    status_parts.append("Empty")
                 else:
-                     # Clear action if player hasn't acted or is waiting
-                     self.seat_action_labels[i].config(text="Last Action: -", foreground="gray")
+                    # Base status (Human, Model, etc.)
+                    base_status = "Human" if i == self.human_player_id else seat_type.capitalize()
+                    status_parts.append(base_status)
+                    # Add state info
+                    if stack <= 0 and not is_active_in_hand: status_parts.append("(Out)") # Busted previously
+                    elif is_folded: status_parts.append("(Folded)")
+                    elif is_all_in: status_parts.append("(All-In)")
+                    # Note: A player can be all-in AND active
 
-        # Force Tkinter to process pending UI updates immediately
-        # self.root.update_idletasks() # Use cautiously, can sometimes cause issues
+                status = " ".join(status_parts)
 
-    def _display_round_results(self, round_info):
-        """ Displays the results of a completed round (showdown or everyone folds). """
-        print("--- Displaying Round Results ---")
-        if not isinstance(round_info, dict):
-             print("Error: Invalid round_info received.")
+                # Determine Last Action String
+                last_action = last_action_data.get(i, "-")
+                # Format action string nicely (e.g., "bet_small" -> "Bet Small")
+                last_action_formatted = last_action.replace('_', ' ').title() if last_action != "-" else "-"
+
+                action_text = f"Bet: ${bet_this_round:,.0f} | Last: {last_action_formatted}"
+
+                # Update Status, Stack, Action Labels
+                self.update_player_status(i, status, stack, action_text)
+
+                # --- Determine Player Cards to Display ---
+                player_hand_to_display = ["??", "??"] # Default hidden
+
+                # 1. Human Player's Hand (priority if available and valid)
+                if i == self.human_player_id and agent_hand:
+                    if isinstance(agent_hand, list) and len(agent_hand) == 2 and all(isinstance(c, str) for c in agent_hand):
+                        player_hand_to_display = agent_hand
+                    # else: print(f"DEBUG: Human hand format issue from info/env: {agent_hand}")
+
+                # 2. Showdown Hands (Only show if round is over AND player was involved)
+                if is_round_over and showdown_hands and i in showdown_hands:
+                     showdown_data = showdown_hands[i]
+                     actual_hand = []
+                     if isinstance(showdown_data, dict): actual_hand = showdown_data.get('hand', [])
+                     elif isinstance(showdown_data, list): actual_hand = showdown_data
+
+                     if isinstance(actual_hand, list) and len(actual_hand) == 2 and all(isinstance(c, str) for c in actual_hand):
+                         player_hand_to_display = actual_hand # Use the showdown hand
+
+                # 3. If not human and not showdown, ensure cards remain hidden
+                elif i != self.human_player_id:
+                     player_hand_to_display = ["??", "??"]
+
+                # 4. Update the Card Images on the UI
+                self.update_player_cards(i, player_hand_to_display)
+                # --- End Card Display Logic ---
+
+            except tk.TclError: return # Stop updates if UI is being destroyed
+            except Exception as e:
+                 print(f"Error updating seat {i}: {e}")
+                 import traceback
+                 traceback.print_exc() # Log error but try to continue updating other seats
+
+
+        # --- Highlight Active Player ---
+        active_player_name = "N/A"
+        self.is_human_turn = False
+        try:
+            if current_player_id is not None and self.seat_config.get(current_player_id) != 'empty':
+                active_player_name = f"P{current_player_id + 1}" # Default name
+                if current_player_id == self.human_player_id:
+                    active_player_name = "Human"
+                self.highlight_active_player(current_player_id) # Apply highlight style
+                self.is_human_turn = (current_player_id == self.human_player_id)
+            else:
+                # No active player (e.g., between rounds, game over)
+                self.highlight_active_player(None) # Remove all highlights
+        except tk.TclError: return # Stop if UI destroyed
+
+        # --- Update Action Buttons and Game Info Panel ---
+        legal_actions = []
+        amount_to_call = 0
+        player_stack = stacks.get(self.human_player_id, 0) # Get human stack for context
+
+        # Get legal actions only if it's human's turn and env allows it
+        if self.is_human_turn and self.env and hasattr(self.env, '_get_legal_actions'):
+            try:
+                legal_actions = self.env._get_legal_actions(self.human_player_id)
+
+                # Calculate amount to call accurately
+                max_bet = 0
+                if current_bets:
+                    active_bets = {p: b for p, b in current_bets.items() if p in active_players_in_round}
+                    if active_bets: max_bet = max(active_bets.values())
+                player_bet = current_bets.get(self.human_player_id, 0)
+                required_to_call = max(0, max_bet - player_bet)
+                amount_to_call = min(required_to_call, player_stack) # Capped by stack
+
+            except Exception as e:
+                print(f"Error getting legal actions or calculating call amount: {e}")
+                legal_actions = []
+                amount_to_call = 0
+
+        # Update action buttons based on turn status and legal actions
+        try:
+            self.update_legal_actions_display(legal_actions, amount_to_call)
+        except tk.TclError: return # Stop if UI destroyed
+
+        # --- Update Game Info Panel ---
+        try:
+            game_stage = info.get('stage', 'PREFLOP') # Default if missing
+            game_stage_str = game_stage.replace('_', ' ').title()
+            dealer_str = f"Player {button_pos + 1}" if button_pos != -1 else "N/A"
+            sb = getattr(self.env, 'small_blind', 0)
+            bb = getattr(self.env, 'big_blind', 0)
+
+            self.update_game_info(
+                round_name=game_stage_str, dealer=dealer_str,
+                small_blind=sb, big_blind=bb,
+                current_player=active_player_name, to_call=amount_to_call
+            )
+        except tk.TclError: return # Stop if UI destroyed
+
+        # --- Handle End-of-Round/Tournament Conditions AFTER UI is updated ---
+        # Use 'after' to schedule handlers, allowing UI to refresh first
+        if is_terminated:
+            # Schedule tournament end handler slightly delayed
+            self.root.after(250, lambda info_copy=info.copy(): self.handle_tournament_end(info_copy))
+        elif is_round_over:
+            # Schedule round end handler with a longer delay to see showdown cards
+            self.root.after(500, lambda info_copy=info.copy(): self.handle_round_end(info_copy))
+
+
+    def process_game_step(self, info):
+        """
+        Determines the next step in the game flow based on the current state info.
+        If it's the human's turn, enables controls.
+        If it's an opponent's turn, schedules their action.
+        If the round/tournament ended, does nothing (handled by delayed callbacks).
+        """
+        if not self.is_game_running or not self.root.winfo_exists():
+            # print("process_game_step skipped: game not running or window closed.")
+            return
+
+        current_player_id = info.get('current_player_id')
+        is_terminated = info.get('terminated', False)
+        is_round_over = info.get('round_over', False)
+
+        # Stop processing if round/tournament ended or no valid player turn
+        if is_terminated or is_round_over or current_player_id is None:
+            # print(f"process_game_step: Halting turn processing (Terminated: {is_terminated}, Round Over: {is_round_over}, Current Player: {current_player_id})")
+            return # End-of-round/tournament logic handled by delayed calls
+
+        # Determine next action based on current player
+        if current_player_id == self.human_player_id:
+            print("Human player's turn.")
+            self.is_human_turn = True
+            # Action buttons are updated via update_ui_from_info -> update_legal_actions_display
+        else:
+            # It's an opponent's turn
+            self.is_human_turn = False
+            # Ensure human buttons are disabled (should be handled by update_legal_actions_display, but belt-and-suspenders)
+            try:
+                 self.update_action_buttons(False)
+            except tk.TclError: return # Stop if UI destroyed
+
+            opponent_type = self.seat_config.get(current_player_id, 'Unknown')
+            print(f"Opponent {current_player_id + 1} ({opponent_type}) turn. Scheduling action...")
+
+            # Schedule the opponent's move after a delay for visual pacing
+            delay_ms = 750 # Adjust delay (milliseconds) as desired
+            self.root.after(delay_ms, self.execute_opponent_turn)
+
+
+    def execute_opponent_turn(self):
+        """
+        Executes a single step for the current AI/random opponent by calling env.step(-1).
+        The environment uses the pre-assigned policy for the current player.
+        """
+        # Double-check conditions before executing turn
+        if not self.is_game_running or not self.root.winfo_exists():
+             # print("execute_opponent_turn skipped: Game stopped or window closed.")
+             return
+        if self.is_human_turn:
+             print("execute_opponent_turn skipped: Became human's turn unexpectedly.")
+             return
+        if not self.env:
+             print("execute_opponent_turn skipped: Environment not available.")
              return
 
-        winners = round_info.get('winners', []) # List of winner player indices
-        showdown_hands_info = round_info.get('showdown_hands', {}) # Dict: {pid: {'hand': [...], 'desc': '...'}}
-        round_reward = round_info.get('round_reward', 0.0) # Reward for the human player this round
-        final_pot = round_info.get('final_pot', self.last_info.get('pot', 0)) # Pot size at end of round
+        print("Executing opponent turn...")
+        try:
+            # Call env.step with a dummy action (-1).
+            # The environment's internal logic should use the assigned policy function
+            # for the current_player_id when the action is -1.
+            encoded_state, reward, terminated, truncated, info = self.env.step(-1)
 
-        # Get all hands dealt at the start of the round (needed even if players folded)
-        # Ensure this attribute exists and is populated correctly in your envs.py
-        all_dealt_hands = getattr(self.env, 'hands', {})
-        if not all_dealt_hands:
-             print("Warning: `env.hands` attribute not found or empty in _display_round_results. Cannot show folded hands.")
+            self.current_game_state = encoded_state # Update state observation
+
+            # Update UI based on the result of the opponent's action
+            self.update_ui_from_info(info)
+
+            # Recursively call process_game_step to handle the *next* player's turn
+            # This allows chains of opponent actions without extra delays between them.
+            # The next call will either schedule another opponent turn or activate human controls.
+            self.process_game_step(info)
+
+        except AttributeError as ae:
+            # Catch errors if self.env becomes None or lacks 'step'
+            messagebox.showerror("Environment Error", f"Error during opponent's turn: {ae}")
+            self.is_game_running = False
+        except Exception as e:
+            messagebox.showerror("Error", f"An unexpected error occurred during opponent's turn: {e}")
+            import traceback
+            traceback.print_exc()
+            self.is_game_running = False # Stop the game on unexpected error
 
 
-        # --- Update Showdown Labels under each Seat ---
-        # This loop iterates through ALL players who were dealt hands initially.
-        for pid, hand_list in all_dealt_hands.items():
-            # Skip empty seats
-            if self.seat_configs.get(pid) == 'empty': continue
+    def handle_player_action(self, action_name):
+        """Handles the button click for a player action (Fold, Check, Call, Bet, All-in)."""
+        # Validate state before processing action
+        if not self.is_human_turn or not self.is_game_running or not self.root.winfo_exists():
+            print("Player action ignored: Not human's turn, game not running, or window closed.")
+            return
+        if not self.env:
+            messagebox.showerror("Error", "Game environment not initialized.")
+            return
 
-            if pid in self.seat_showdown_card_labels and self.seat_showdown_card_labels[pid].winfo_exists():
-                # Format hand string using card_utils - this shows the cards regardless of fold status
-                hand_str = render_hand(hand_list, separator=" ") if hand_list else "N/A"
+        # Get action index from action name
+        action_idx = self.string_to_action.get(action_name)
+        if action_idx is None:
+            messagebox.showerror("Internal Error", f"Invalid action name received from button: {action_name}")
+            return
 
-                # Get hand description (e.g., "Pair of Kings") ONLY if available from showdown_info
-                # We don't evaluate folded hands here to avoid extra computation/complexity,
-                # but we DO show their dealt cards via hand_str.
-                desc_str = ""
-                if pid in showdown_hands_info:
-                    desc_str = showdown_hands_info[pid].get('desc', '')
+        # --- Pre-Action Legality Check (Optional but Recommended) ---
+        # Double-check if the action is still legal right before sending it.
+        # This helps catch race conditions where the state might change slightly.
+        try:
+             if hasattr(self.env, '_get_legal_actions'):
+                 current_legal_actions = self.env._get_legal_actions(self.human_player_id)
+                 if action_name not in current_legal_actions:
+                     messagebox.showwarning("Invalid Action", f"Action '{action_name}' is no longer legal. The game state may have changed.", parent=self.root)
+                     # Refresh button states based on the actual current legal actions
+                     try:
+                         amount_to_call_str = self.tocall_value.cget("text")
+                         amount_to_call = float(amount_to_call_str.replace("$","").replace(",",""))
+                     except: amount_to_call = 0 # Fallback
+                     self.update_legal_actions_display(current_legal_actions, amount_to_call)
+                     return # Do not proceed with the illegal action
+             # else: print("Warning: Environment missing '_get_legal_actions' for pre-action check.")
+        except Exception as e:
+             messagebox.showerror("Error", f"Could not verify legal actions before sending: {e}", parent=self.root)
+             return # Don't proceed if legality check fails
+        # --- End Pre-Action Check ---
 
-                # Construct display text - includes cards for everyone, description only for shown hands
-                display_text = f"Cards: {hand_str}"
-                if desc_str:
-                    display_text += f"\n({desc_str})"
 
-                # Update the label under the player's seat frame
-                self.seat_showdown_card_labels[pid].config(text=display_text)
-            elif pid not in self.seat_showdown_card_labels:
-                 # Only warn if it's not an empty seat
-                 if self.seat_configs.get(pid) != 'empty':
-                      print(f"Warning: No showdown label found for player {pid}")
+        print(f"Player action chosen: {action_name} (Index: {action_idx})")
+        self.is_human_turn = False # Player has acted, turn is over
+        self.update_action_buttons(False) # Disable buttons immediately
 
-        # --- Update Central Overview Label ---
-        overview_text = f"Round Over! Final Pot: ${final_pot:.2f}\n"
-        if winners:
-            win_amount = final_pot / len(winners) if winners else 0
-            # Convert indices to seat numbers (1-based)
-            winner_seats = [w + 1 for w in winners if self.seat_configs.get(w) != 'empty']
-            overview_text += f"Winner(s): Seat(s) {', '.join(map(str, winner_seats))} (${win_amount:.2f} each)\n"
+        try:
+            # Send the chosen action index to the environment
+            encoded_state, reward, terminated, truncated, info = self.env.step(action_idx)
+            self.current_game_state = encoded_state # Store new state observation
 
-            # Try to get the description of the winning hand(s)
-            win_desc = ""
-            # Check if the first winner showed their hand
-            if winners and winners[0] in showdown_hands_info:
-                 win_desc = showdown_hands_info[winners[0]].get('desc', '')
-            # If multiple winners, maybe list all descriptions? For now, just first.
+            # Update UI based on the result of the human action
+            self.update_ui_from_info(info)
 
-            if win_desc:
-                 overview_text += f"Winning Hand: {win_desc}\n"
+            # Process the next game step (likely an opponent's turn now, or round/game end)
+            self.process_game_step(info)
+
+        except AttributeError as ae:
+            messagebox.showerror("Environment Error", f"Error processing action '{action_name}': {ae}")
+            self.is_game_running = False # Stop game on critical env error
+        except Exception as e:
+            messagebox.showerror("Error", f"An unexpected error occurred processing action '{action_name}': {e}")
+            import traceback
+            traceback.print_exc()
+            # Consider stopping the game on error, as state might be inconsistent
+            # self.is_game_running = False
+
+
+    def handle_round_end(self, info):
+        """
+        Handles the end of a poker hand/round.
+        Updates the summary display with results and schedules the next round if applicable.
+        """
+        if not self.root.winfo_exists(): return # Stop if window closed
+        print("--- Round Ended ---")
+        # UI should already reflect the final state of the round due to update_ui_from_info
+
+        # Extract results from info dictionary
+        winners = info.get('winners', []) # List of winner IDs or potentially dict {id: amount}
+        showdown_hands = info.get('showdown_hands', {}) # {id: {'hand':[], 'desc':''}} or None
+        final_pot = info.get('final_pot', info.get('pot', 0)) # Pot value at end
+        winnings = info.get('winnings', {}) # Preferred way: {player_id: amount_won}
+
+        # --- Construct Round Summary Text ---
+        result_parts = [f"Prev. Round Pot: ${final_pot:,.0f}."] # Start with pot size
+
+        if winnings: # Use winnings dictionary if available
+             winners_summary = []
+             # Sort by amount won (descending) for clarity
+             sorted_winnings = sorted(winnings.items(), key=lambda item: item[1], reverse=True)
+
+             for w_id, amount_won in sorted_winnings:
+                 if amount_won > 0: # Only list players who actually won something
+                     w_name = f"P{w_id+1}" if w_id != self.human_player_id else "Human"
+                     summary_part = f"{w_name} wins ${amount_won:,.0f}"
+
+                     # Try to add hand description if available from showdown hands
+                     if showdown_hands and w_id in showdown_hands:
+                          hand_data = showdown_hands[w_id]
+                          desc = "N/A"
+                          hand_list = []
+                          if isinstance(hand_data, dict):
+                              desc = hand_data.get('desc', 'N/A')
+                              hand_list = hand_data.get('hand', [])
+                          elif isinstance(hand_data, list): # Older format?
+                               hand_list = hand_data
+
+                          # Add description if valid
+                          if desc and desc != 'N/A' and len(desc) > 3:
+                              summary_part += f" ({desc})"
+                          # Fallback: try rendering hand list if description missing but hand exists
+                          elif hand_list:
+                               try:
+                                   # Use card_utils if available to render hand string
+                                   hand_str = render_hand(hand_list) # Assumes render_hand imported
+                                   summary_part += f" ({hand_str})"
+                               except NameError: pass # card_utils or render_hand not available
+
+                     winners_summary.append(summary_part)
+
+             if winners_summary:
+                  result_parts.append("Outcome: " + "; ".join(winners_summary) + ".")
+             else:
+                 result_parts.append("Round ended, but no winnings recorded.")
+
+        elif winners and not winnings: # Fallback if only 'winners' list is present (less ideal)
+            winner_names = [f"P{w_id+1}" if w_id != self.human_player_id else "Human" for w_id in winners]
+            result_parts.append(f"Winner(s): {', '.join(winner_names)}.")
+            # Try getting hand desc for first winner as fallback
+            if winners and showdown_hands and winners[0] in showdown_hands:
+                 hand_data = showdown_hands[winners[0]]
+                 if isinstance(hand_data, dict): desc = hand_data.get('desc')
+                 else: desc = None # Cannot get desc from list
+                 if desc: result_parts.append(f"Hand: {desc}.")
+
         else:
-            # This might happen if everyone folds except one person before showdown
-            # Find the single remaining active player
-            active_in_round = self.last_info.get('active_players', [])
-            # Filter out empty seats from active_in_round
-            active_playing = [p for p in active_in_round if self.seat_configs.get(p) != 'empty']
+            result_parts.append("Round ended, outcome unclear.") # e.g., error or unusual fold scenario
 
-            if len(active_playing) == 1:
-                 last_man_standing = active_playing[0]
-                 overview_text += f"Winner: Seat {last_man_standing + 1} (Opponents Folded)\n"
-            else:
-                 overview_text += "No winner determined (e.g., error or unusual fold scenario).\n"
+        summary_text = " ".join(result_parts)
+        self.update_last_round_display(summary_text) # Update label
 
-
-        # Add human player's reward for the round
-        if self.human_player_seat != -1 and self.seat_configs.get(self.human_player_seat) != 'empty':
-            reward_color = "green" if round_reward > 0 else "red" if round_reward < 0 else "black"
-            # Simple text version, coloring requires more complex handling (e.g., tags in Text widget)
-            overview_text += f"Your Round Reward: ${round_reward:.2f}"
-
-        # Update the central overview label
-        if self.showdown_overview_label and self.showdown_overview_label.winfo_exists():
-            self.showdown_overview_label.config(text=overview_text)
-
-        # Update status bar with a concise result
-        status_msg = overview_text.split('\n')[1] if winners or len(self.last_info.get('active_players', [])) == 1 else "Round Over."
-        if self.status_bar.winfo_exists(): self.status_bar.config(text=status_msg)
-        # self.root.update_idletasks() # Ensure UI updates before the pause
-
-    def _handle_tournament_end(self, final_info):
-        """ Handles the end of the tournament, displays results, and prompts for a new game. """
-        print("\n--- Tournament Ended (UI Handling) ---")
-        self.tournament_running = False # Stop the game loop
-
-        # Disable action buttons and update turn label
-        for btn in self.action_buttons.values():
-            if btn.winfo_exists(): btn.config(state=tk.DISABLED)
-        if self.turn_label.winfo_exists(): self.turn_label.config(text="Tournament Over", foreground="darkred")
-
-        # Determine the winner based on final stacks (considering only non-empty seats)
-        final_stacks = final_info.get('stacks', {})
-        winner_id = -1 # -1: Undetermined, -2: No winner
-        max_stack = -1
-        playing_players = [i for i, t in self.seat_configs.items() if t != 'empty']
+        # --- Schedule Next Round ---
+        # Only start the next round if the tournament hasn't terminated overall
+        if self.is_game_running and not info.get('terminated', False):
+            print("Scheduling next round...")
+            # Delay before starting the next hand (e.g., 3 seconds) to allow players to read results
+            self.root.after(3000, self.start_next_round_in_tournament)
+        elif not self.is_game_running:
+             print("Round ended, but game is stopped. Not scheduling next round.")
+        else: # Tournament terminated
+            print("Round ended, and tournament also terminated.")
+            # Tournament end message is handled by handle_tournament_end
 
 
-        # Find players with chips remaining among playing players
-        active_players = [p for p in playing_players if final_stacks.get(p, 0) > 0]
+    def start_next_round_in_tournament(self):
+        """
+        Initiates the next hand/round within the current tournament.
+        Calls env.step(-1) assuming the environment handles new hand setup internally.
+        """
+        # Check conditions before proceeding
+        if not self.is_game_running or not self.root.winfo_exists():
+            print("Cannot start next round: game not running or window closed.")
+            return
+        if not self.env:
+             print("Cannot start next round: environment not available.")
+             return
+
+        print("Starting next round...")
+        try:
+            # Call step with -1; environment should handle dealing new cards, moving blinds, etc.
+            # This relies on the environment's step function correctly interpreting -1 after a round end.
+            encoded_state, reward, terminated, truncated, info = self.env.step(-1)
+            self.current_game_state = encoded_state
+
+            # Update UI with the state for the start of the new round
+            self.update_ui_from_info(info)
+
+            # Process the first turn of the new round
+            self.process_game_step(info)
+
+        except AttributeError as ae:
+            messagebox.showerror("Environment Error", f"Error starting next round: {ae}")
+            self.is_game_running = False
+        except Exception as e:
+            messagebox.showerror("Error", f"Unexpected error starting next round: {e}")
+            import traceback
+            traceback.print_exc()
+            self.is_game_running = False # Stop game on error
+
+
+    def handle_tournament_end(self, info):
+        """
+        Handles the end of the entire tournament.
+        Displays final results and prompts the user to play again or quit.
+        """
+        if not self.root.winfo_exists(): return # Stop if window closed
+        print("===== Tournament Ended =====")
+        self.is_game_running = False # Stop game loop processing
+        self.is_human_turn = False
+        try:
+            self.update_action_buttons(False) # Disable all action buttons
+        except tk.TclError: pass # Ignore if UI closing
+
+        # UI should already reflect the final state from the last update_ui_from_info call
+
+        stacks = info.get('stacks', {})
+        # Determine winner(s) - usually the last player(s) with chips
+        active_players = [p for p, s in stacks.items() if s > 0 and self.seat_config.get(p) != 'empty']
+
+        winner_text = "Tournament Over!\n\n" # Start of message dialog text
 
         if len(active_players) == 1:
-            winner_id = active_players[0] # Single player remaining is the winner
-        elif not active_players and playing_players: # No active players, but some were playing
-             print("Warning: Tournament ended with no players having stacks > 0. Finding max stack among playing players.")
-             max_stack = -float('inf')
-             for pid in playing_players:
-                  stack = final_stacks.get(pid, 0)
-                  if stack > max_stack:
-                       max_stack = stack
-                       winner_id = pid
-             if max_stack <= 0 : winner_id = -2 # Truly no winner if max stack is <= 0
-        elif not playing_players: # No playing players at all
-             winner_id = -2
-             print("Warning: Tournament ended with no playing players configured.")
-        else: # Multiple players remain active (e.g., truncated), declare highest stack winner
-            print(f"Tournament ended with multiple players active: {active_players}. Declaring highest stack winner.")
-            for pid in active_players:
-                 if final_stacks.get(pid, 0) > max_stack:
-                     max_stack = final_stacks.get(pid, 0)
-                     winner_id = pid
+            # Single winner scenario
+            winner_id = active_players[0]
+            winner_name = "Human" if winner_id == self.human_player_id else f"Player {winner_id + 1}"
+            final_stack = stacks.get(winner_id, 0)
+            winner_text += f"{winner_name} wins the tournament with ${final_stack:,.0f}!"
+        elif len(active_players) > 1:
+            # Multiple players left (e.g., timed tournament, error state?)
+            winner_text += "Tournament ended.\nFinal Stacks:"
+            # Sort by stack descending for ranking
+            sorted_stacks = sorted(stacks.items(), key=lambda item: item[1], reverse=True)
+            for p_id, stack in sorted_stacks:
+                if self.seat_config.get(p_id) != 'empty': # Only show non-empty seats
+                    player_name = "Human" if p_id == self.human_player_id else f"Player {p_id + 1}"
+                    winner_text += f"\n  {player_name}: ${stack:,.0f}"
+        else:
+            # No players left with chips? Should not happen in standard poker.
+            winner_text += "Tournament ended unexpectedly with no players having chips."
 
-        # --- Construct Result Message ---
-        result_message = "Tournament Over!\n\n"
-        if winner_id >= 0:
-            win_msg = f"Seat {winner_id + 1} ({self.seat_configs.get(winner_id, 'N/A').title()}) wins!"
-            if winner_id == self.human_player_seat:
-                win_msg += " Congratulations!"
-            result_message += win_msg + "\n"
-        elif winner_id == -2:
-             result_message += "Tournament ended unexpectedly with no winner.\n"
-        else: # Should only happen if multiple players finish with exact same highest stack (unlikely)
-             result_message += "Tournament ended. Highest stack wins.\n" # Generic message
+        # Display the result in a dialog box using the internal helper method
+        # This is called after a delay from update_ui_from_info, so show immediately
+        self._show_tournament_end_dialog(winner_text)
 
-        # Add human player elimination status
-        is_human_playing = self.human_player_seat != -1 and self.seat_configs.get(self.human_player_seat) != 'empty'
-        if is_human_playing and final_stacks.get(self.human_player_seat, 0) <= 0 and winner_id != self.human_player_seat:
-             result_message += "You were eliminated.\n"
 
-        # List final stacks for non-empty seats
-        result_message += "\nFinal Stacks:\n"
-        for pid in range(NUM_PLAYERS):
-             if self.seat_configs.get(pid) != 'empty': # Only show non-empty seats
-                 stack = final_stacks.get(pid, 0)
-                 result_message += f"  Seat {pid+1}: ${stack:.2f}\n"
+    def _show_tournament_end_dialog(self, winner_text):
+        """Shows a modal dialog box with tournament results and asks to play again."""
+        # Ensure the dialog is modal to the root window using 'parent'
+        play_again = messagebox.askyesno("Tournament Over",
+                                         f"{winner_text}\n\nStart a new tournament?",
+                                         parent=self.root)
+        if play_again:
+            # User wants to play again, re-run the setup process
+            self.setup_game()
+        else:
+            # User chose not to play again, close the application
+            self.root.quit()
 
-        print(result_message) # Log final results
 
-        # --- Prompt for New Game ---
-        # Use root.after to ensure the message box appears after the current event loop cycle
-        self.root.after(200, lambda msg=result_message: self._prompt_new_game(msg))
+    # --- UI Creation Methods ---
 
-    def _prompt_new_game(self, result_message):
-        """ Shows a message box with results and asks to play again or reconfigure. """
-        # Ensure game window still exists before showing message box relative to it
-        parent_window = self.game_window if (self.game_window and self.game_window.winfo_exists()) else self.root
+    def _create_header(self):
+        """Creates the header section with title and control buttons."""
+        # Use TFrame for consistency with theme
+        self.header_frame = ttk.Frame(self.main_frame, style='Header.TFrame', padding=(10, 5))
+        self.header_frame.columnconfigure(0, weight=1) # Allow title label to potentially expand
+
+        # Title Label on the left
+        ttk.Label(self.header_frame, text="Enhanced Poker", style='Title.TLabel').grid(row=0, column=0, sticky='w')
+
+        # Button container frame, aligned right using grid
+        button_container = ttk.Frame(self.header_frame, style='Header.TFrame')
+        button_container.grid(row=0, column=1, sticky='e') # Place in column 1, align East
+
+        # Buttons packed horizontally within the button container
+        ttk.Button(button_container, text="Configure Seats", command=self._show_seat_config_dialog, style='Header.TButton').pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_container, text="New Tournament", command=self.setup_game, style='Header.TButton').pack(side=tk.LEFT, padx=5)
+
+
+    def _create_table_area_contents(self):
+        """Creates the widgets that go *inside* the table_container, including the table_frame itself."""
+        # Table frame (the visible oval/rectangle) - placed inside table_container
+        # This frame uses the 'Table.TFrame' style defined in poker_theme.py
+        self.table_frame = ttk.Frame(self.table_container, style='Table.TFrame')
+        # Initial placement; size/position will be updated by _resize_table
+        self.table_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER, width=800, height=500)
+
+        # Pot label - placed relative to table_frame
+        self.pot_label = ttk.Label(self.table_frame, text="Pot: $0", style='Pot.TLabel')
+        self.pot_label.place(relx=0.5, rely=0.25, anchor=tk.CENTER) # Positioned near top-center of table
+
+        # Player Seats - Create the seat widgets
+        self._create_player_seats()
+        # Note: Seats are *not* placed here; _reposition_seats handles their placement within table_frame
+
+        # Community Cards - Create the container and labels
+        self._create_community_cards()
+        # Note: Community card container is placed relative to table_frame
+
+
+    def _create_player_seats(self):
+        """Creates the LabelFrames and internal widgets for each player seat."""
+        # **FIX**: Adjusted relative positions for more buffer from table edges
+        # These define the anchor points for each seat relative to table_frame dimensions
+        self.seat_positions = [
+            # Seat 0 (Bottom Left - Default Human)
+            {'relx': 0.08, 'rely': 0.88, 'anchor': tk.SW }, # Anchor South-West
+            # Seat 1 (Middle Left)
+            {'relx': 0.0, 'rely': 0.50, 'anchor': tk.W },  # Anchor West
+            # Seat 2 (Top Left)
+            {'relx': 0.08, 'rely': 0.12, 'anchor': tk.NW }, # Anchor North-West
+            # Seat 3 (Top Right)
+            {'relx': 0.92, 'rely': 0.12, 'anchor': tk.NE }, # Anchor North-East
+            # Seat 4 (Middle Right)
+            {'relx': 1.0, 'rely': 0.50, 'anchor': tk.E },  # Anchor East
+            # Seat 5 (Bottom Right)
+            {'relx': 0.92, 'rely': 0.88, 'anchor': tk.SE }  # Anchor South-East
+        ][:NUM_PLAYERS] # Ensure we only take positions needed for the number of players
+
+        self.seat_frames_widgets = {} # Clear any previous widgets before creating new ones
+        for i in range(NUM_PLAYERS):
+            # Determine the correct style for the seat frame
+            seat_style = 'Human.Seat.TLabelframe' if i == self.human_player_id else 'Seat.TLabelframe'
+
+            # Create the main LabelFrame for the seat
+            seat = ttk.LabelFrame(
+                self.table_frame, # Parent is the table_frame
+                text=f"Seat {i+1}", # Label text for the frame
+                style=seat_style,
+                padding=(5, 5) # Internal padding around contents
+            )
+            # Prevent the frame from shrinking/growing based on its content size
+            # Its size will be explicitly set by 'place' in _reposition_seats
+            seat.pack_propagate(False)
+
+            # --- Internal structure using grid for better layout control ---
+            seat.columnconfigure(0, weight=3, minsize=60) # Column for text info (more weight)
+            seat.columnconfigure(1, weight=2, minsize=50) # Column for cards (less weight)
+            seat.rowconfigure(0, weight=1) # Single row spanning vertically
+
+            # Frame for text info (Status, Stack, Action)
+            text_f = ttk.Frame(seat, style='TFrame', padding=(2, 0))
+            text_f.grid(row=0, column=0, sticky='nsew', padx=(3, 2), pady=2)
+
+            # Configure rows within text_f to space out labels vertically
+            text_f.rowconfigure(0, weight=1) # Status row
+            text_f.rowconfigure(1, weight=1) # Stack row
+            text_f.rowconfigure(2, weight=1) # Action row
+            text_f.columnconfigure(0, weight=1) # Single column for text labels
+
+            # Create text labels
+            status = ttk.Label(text_f, text="Status: -", anchor=tk.W, style='SeatText.TLabel')
+            status.grid(row=0, column=0, sticky='ew', pady=1)
+            stack  = ttk.Label(text_f, text="Stack: $0", anchor=tk.W, style='SeatText.TLabel')
+            stack.grid(row=1, column=0, sticky='ew', pady=1)
+            action = ttk.Label(text_f, text="Last: - | Bet: $0", anchor=tk.W, style='SeatText.TLabel')
+            action.grid(row=2, column=0, sticky='ew', pady=1)
+
+            # Frame for card images
+            # **FIX**: Increased horizontal padding around the card frame
+            cards_f = ttk.Frame(seat, style='TFrame')
+            cards_f.grid(row=0, column=1, sticky='nsew', padx=(5, 10), pady=5) # More padding left/right
+
+            # Center cards vertically and horizontally within cards_f using grid
+            cards_f.columnconfigure(0, weight=1) # Card 1 column
+            cards_f.columnconfigure(1, weight=1) # Card 2 column
+            cards_f.rowconfigure(0, weight=1) # Single row, centers vertically
+
+            # Initial card size calculation (small placeholder for initialization)
+            init_w = max(20, int(self.card_generator.base_card_width * 0.40))
+            init_h = max(30, int(self.card_generator.base_card_height * 0.40))
+            placeholder = self.card_generator.get_placeholder_image((init_w, init_h))
+
+            # Create Card Labels
+            c1 = ttk.Label(cards_f, image=placeholder)
+            c1.image = placeholder # Keep reference to prevent garbage collection
+            # **FIX**: Added padding between cards using grid padx
+            c1.grid(row=0, column=0, sticky='nse', padx=(0, 2)) # Align East, pad right
+
+            c2 = ttk.Label(cards_f, image=placeholder)
+            c2.image = placeholder # Keep reference
+            # **FIX**: Added padding between cards using grid padx
+            c2.grid(row=0, column=1, sticky='nsw', padx=(2, 0)) # Align West, pad left
+
+            # Store references to all widgets for this seat
+            self.seat_frames_widgets[i] = {
+                'frame': seat,
+                'status': status,
+                'stack': stack,
+                'action': action,
+                'cards': [c1, c2], # List of card labels
+                'card_size': (init_w, init_h) # Store initial/current card size
+            }
+
+
+    def _create_community_cards(self):
+        """Creates the container and labels for the community cards."""
+        # Container for community cards - placed relative to table_frame center
+        self.community_container = ttk.Frame(self.table_frame, style='TFrame')
+        self.community_container.place(relx=0.5, rely=0.55, anchor=tk.CENTER) # Position below pot
+
+        self.community_card_labels = [] # Clear previous labels if any
+        # Initial size calculation (will be updated by resize logic)
+        init_w = int(self.card_generator.base_card_width * 0.6)
+        init_h = int(self.card_generator.base_card_height * 0.6)
+        self.community_card_size = (max(30, init_w), max(45, init_h)) # Store initial size
+        placeholder = self.card_generator.get_placeholder_image(self.community_card_size)
+
+        # Create 5 labels for the community cards (Flop, Turn, River)
+        for i in range(5):
+            lbl = ttk.Label(self.community_container, image=placeholder)
+            lbl.image = placeholder # Keep reference
+            # Pack horizontally within their container, add padding between cards
+            lbl.pack(side=tk.LEFT, padx=4)
+            self.community_card_labels.append(lbl)
+
+
+    def _create_action_panel(self):
+        """Creates the panel containing player action buttons."""
+        # Panel for action buttons - Gets packed into bottom_panels_frame
+        self.action_panel = ttk.LabelFrame(self.bottom_panels_frame, text="Player Actions", style='TLabelframe')
+
+        # Frame to hold the buttons themselves, allows centering within the panel
+        self.action_buttons_frame = ttk.Frame(self.action_panel, style='TFrame')
+        self.action_buttons_frame.pack(pady=5) # Use pack's default centering
+
+        # Define button styles (these should be configured in PokerTheme)
+        styles = {
+            'fold':'Fold.TButton', 'check':'Check.TButton', 'call':'Call.TButton',
+            'bet_small':'Bet.TButton', 'bet_big':'Bet.TButton', 'all_in':'AllIn.TButton'
+        }
+        self.action_buttons = {} # Clear previous button references
+
+        # Define the order and text for action buttons
+        action_order = ['fold', 'check', 'call', 'bet_small', 'bet_big', 'all_in']
+        action_texts = { # More descriptive text
+             'fold': 'Fold', 'check': 'Check', 'call': 'Call',
+             'bet_small': 'Bet (1/2 Pot)', # Example bet sizing text
+             'bet_big': 'Bet (Pot)',     # Example bet sizing text
+             'all_in': 'All-In'
+        }
+
+        # Create buttons
+        for action_name in action_order:
+            btn_text = action_texts.get(action_name, action_name.title()) # Get text, fallback to title case
+            style_key = styles.get(action_name, 'TButton') # Get style, fallback to default
+
+            b = ttk.Button(
+                self.action_buttons_frame,
+                text=btn_text,
+                style=style_key,
+                # Lambda function captures the action_name for the command
+                command=lambda act=action_name: self.handle_player_action(act),
+                state=tk.DISABLED # Start all buttons disabled
+            )
+            # Pack buttons horizontally with padding
+            b.pack(side=tk.LEFT, padx=5, pady=5, ipady=2) # Add internal vertical padding
+            self.action_buttons[action_name] = b # Store button reference
+
+
+    def _create_game_info_panel(self):
+        """Creates the panel displaying general game information (round, blinds, etc.)."""
+        # Panel for game info - Gets packed into bottom_panels_frame
+        self.info_panel = ttk.LabelFrame(self.bottom_panels_frame, text="Game Information", style='TLabelframe')
+
+        # Use grid inside the panel for neat alignment of labels
+        grid = ttk.Frame(self.info_panel, style='TFrame')
+        grid.pack(fill=tk.X, padx=10, pady=(2, 5)) # Padding around the grid
+
+        # Configure columns to distribute space somewhat evenly
+        num_info_cols = 6 # 3 pairs of Label:Value
+        for col in range(num_info_cols):
+            grid.columnconfigure(col, weight=1, minsize=80) # Give weight and minimum size
+
+        # Define styles for info labels for consistency
+        ts = 'SmallInfoText.TLabel' # Style for text labels (e.g., "Round:")
+        vs = 'SmallInfoValue.TLabel' # Style for value labels (e.g., "Flop")
+
+        # --- Row 0: Round, Blinds, Current Player ---
+        ttk.Label(grid, text="Round:", style=ts).grid(row=0, column=0, sticky=tk.W, padx=5)
+        self.round_value = ttk.Label(grid, text="-", style=vs, anchor=tk.W)
+        self.round_value.grid(row=0, column=1, sticky=tk.EW, padx=5) # EW sticky to fill column
+
+        ttk.Label(grid, text="SB/BB:", style=ts).grid(row=0, column=2, sticky=tk.W, padx=5)
+        self.blinds_value = ttk.Label(grid, text="$0 / $0", style=vs, anchor=tk.W)
+        self.blinds_value.grid(row=0, column=3, sticky=tk.EW, padx=5)
+
+        ttk.Label(grid, text="Player Turn:", style=ts).grid(row=0, column=4, sticky=tk.W, padx=5)
+        self.current_value = ttk.Label(grid, text="-", style=vs, anchor=tk.W)
+        self.current_value.grid(row=0, column=5, sticky=tk.EW, padx=5)
+
+        # --- Row 1: Dealer, To Call ---
+        ttk.Label(grid, text="Dealer:", style=ts).grid(row=1, column=0, sticky=tk.W, padx=5)
+        self.dealer_value = ttk.Label(grid, text="-", style=vs, anchor=tk.W)
+        self.dealer_value.grid(row=1, column=1, sticky=tk.EW, padx=5)
+
+        # Columns 2 and 3 are empty in this row for spacing
+
+        ttk.Label(grid, text="To Call:", style=ts).grid(row=1, column=4, sticky=tk.W, padx=5)
+        self.tocall_value = ttk.Label(grid, text="$0", style=vs, anchor=tk.W)
+        self.tocall_value.grid(row=1, column=5, sticky=tk.EW, padx=5)
+
+
+    def _create_last_round_panel(self):
+        """Creates the panel displaying the summary of the previous hand."""
+        # Panel for last round summary - Gets packed into bottom_panels_frame
+        self.last_round_panel = ttk.LabelFrame(self.bottom_panels_frame, text="Last Round Summary", style='TLabelframe')
+
+        # Label for the summary text itself
+        self.last_round_summary_label = ttk.Label(
+            self.last_round_panel,
+            text=self.last_round_summary, # Initial text
+            wraplength=300, # Initial wrap length, updated dynamically on resize
+            anchor=tk.W, justify=tk.LEFT, # Align text left
+            padding=(5, 3), # Internal padding inside the label
+            style='SmallInfoText.TLabel' # Use smaller font style
+        )
+        # Pack to fill horizontally, allowing text wrapping
+        self.last_round_summary_label.pack(fill=tk.X, expand=True, pady=1, padx=5)
+
+
+    def update_last_round_display(self, summary_text=None):
+        """Updates the text and wraplength of the last round summary label."""
+        # Update internal state if new text is provided
+        if summary_text is not None:
+             self.last_round_summary = summary_text
+
+        # Check if the label widget exists before trying to configure it
+        if hasattr(self, 'last_round_summary_label') and self.last_round_summary_label and self.last_round_summary_label.winfo_exists():
+            try:
+                # Configure the text content
+                self.last_round_summary_label.configure(text=self.last_round_summary)
+
+                # Update wraplength based on the panel's current width for proper wrapping
+                panel_width = self.last_round_panel.winfo_width()
+                # Set wraplength slightly less than panel width to avoid edge cases/padding issues
+                wrap_length = max(100, panel_width - 20) # Ensure a minimum wrap length
+                self.last_round_summary_label.configure(wraplength=wrap_length)
+            except tk.TclError:
+                 # Handle cases where widget might be destroyed during update
+                 # print("Warning: TclError updating last round display.")
+                 pass
+
+
+    # --- Resizing Logic ---
+
+    def _on_window_resize(self, event):
+        """Callback function triggered when the main window is resized."""
+        # Debounce resize events: If multiple resize events occur quickly,
+        # cancel any pending resize task and schedule a new one after a short delay.
+        # Only trigger the actual resize logic for events on the root window itself.
+        if event.widget == self.root:
+            if self._resize_job:
+                self.root.after_cancel(self._resize_job)
+            # Schedule the _resize_table method to run after 150ms of inactivity
+            self._resize_job = self.root.after(150, self._resize_table)
+
+    def _resize_table(self):
+        """
+        Recalculates positions and sizes of table elements (table frame, seats, cards)
+        based on the current size of the table_container frame.
+        This is the core layout adjustment logic called after a window resize.
+        """
+        # Clear the pending resize job ID as this function is now running
+        self._resize_job = None
+
+        # Ensure the container widget exists and has valid dimensions before proceeding
+        if not hasattr(self, 'table_container') or not self.table_container.winfo_exists():
+            # print("Resize skipped: table_container not ready.")
+            return
 
         try:
-            response = messagebox.askyesno(
-                "Tournament Over",
-                result_message + "\nStart a new tournament with the same configuration?",
-                parent=parent_window # Make message box appear over game window or root
-            )
-        except tk.TclError as e:
-             print(f"Error showing messagebox (window might be destroyed): {e}")
-             # Default to reconfigure if message box fails
-             self._reconfigure()
+            container_width = self.table_container.winfo_width()
+            container_height = self.table_container.winfo_height()
+        except tk.TclError:
+            # print("Resize skipped: Failed to get table_container dimensions (TclError).")
+            return # Error getting dimensions (e.g., during shutdown)
+
+        # Avoid calculations if container size is unrealistically small (can happen during init)
+        if container_width < 100 or container_height < 100:
+            # print(f"Resize deferred: container size invalid ({container_width}x{container_height}). Retrying...")
+            # Schedule another attempt slightly later if size is still invalid
+            self._resize_job = self.root.after(200, self._resize_table)
+            return
+
+        # print(f"Resizing table area. Container: {container_width}x{container_height}") # Debug
+
+        # --- Calculate Table Frame Dimensions ---
+        # Aim for a target aspect ratio for the table surface itself (e.g., 1.6 : 1)
+        target_aspect_ratio = 1.6 # Width to Height ratio
+        padding_x = 0 # Horizontal padding inside the container around the table frame
+        padding_y = 0     # Vertical padding inside the container around the table frame
+
+        # Calculate available space within the container, minus padding
+        available_width = container_width - 2 * padding_x
+        available_height = container_height - 2 * padding_y
+
+        if available_width <= 0 or available_height <= 0:
+             # print("Resize skipped: No available space after padding.")
+             return # No space to draw the table
+
+        # Determine table size based on available space and aspect ratio
+        # Start by assuming width is the limiting factor
+        table_width = available_width
+        table_height = table_width / target_aspect_ratio
+
+        # If calculated height exceeds available height, then height is the limiting factor
+        if table_height > available_height:
+            table_height = available_height
+            table_width = table_height * target_aspect_ratio
+
+        # Apply minimum size constraints for the table frame itself
+        min_table_width = 500 # Minimum reasonable width for the table surface
+        min_table_height = min_table_width / target_aspect_ratio
+        table_width = max(table_width, min_table_width)
+        table_height = max(table_height, min_table_height)
+
+        # --- Apply Resized Dimensions and Reposition Internal Elements ---
+        if hasattr(self, 'table_frame') and self.table_frame.winfo_exists():
+            try:
+                 # Update the size of the table_frame using place_configure.
+                 # Centering is handled by place(relx=0.5, rely=0.5, anchor=center).
+                 self.table_frame.place_configure(width=int(table_width), height=int(table_height))
+                 # print(f"Table frame resized to: {int(table_width)}x{int(table_height)}") # Debug
+
+                 # --- Reposition elements *within* the resized table_frame ---
+                 # Pot label (relative placement should adapt, but explicit helps ensure it)
+                 if hasattr(self, 'pot_label') and self.pot_label.winfo_exists():
+                     self.pot_label.place_configure(relx=0.5, rely=0.25, anchor=tk.CENTER)
+
+                 # Community card container (relative placement should adapt)
+                 if hasattr(self, 'community_container') and self.community_container.winfo_exists():
+                     self.community_container.place_configure(relx=0.5, rely=0.55, anchor=tk.CENTER)
+                     # Resize the community cards themselves based on new table width
+                     self._resize_community_cards(table_width)
+
+                 # Reposition and resize player seats based on the new table dimensions
+                 self._reposition_seats(table_width, table_height)
+
+            except tk.TclError as e:
+                 # Catch errors if widgets are destroyed during the update process
+                 print(f"Warning: TclError during table element resize/reposition: {e}")
+
+        # Update wraplength for the last round summary label based on its panel's current width
+        self.update_last_round_display()
+
+
+    def _reposition_seats(self, table_width, table_height):
+        """
+        Recalculates positions and sizes of player seats based on the current table_frame size.
+        Also resizes the card images within each seat.
+        """
+        if not hasattr(self, 'seat_frames_widgets') or not self.seat_frames_widgets:
+            return # Seats not created yet
+
+        # --- Calculate Scaling Factor ---
+        # Determine how much to scale seats based on table width relative to a base design width
+        base_table_width_for_scaling = 800 # The table width at which base_seat_width/height look good
+        scale_factor = table_width / base_table_width_for_scaling
+        # Clamp scale factor: Allow shrinking, but limit growth (e.g., max 100% of base size)
+        # **FIX**: Clamp ensures seats don't get *larger* than base size * scale_factor=1.0
+        scale_factor = max(0.65, min(scale_factor, 1.0)) # Allow shrinking down to 65%, max is 100%
+
+        # --- Calculate New Seat Dimensions ---
+        # Apply scale factor to base dimensions defined in __init__
+        seat_width = int(self.base_seat_width * scale_factor)
+        seat_height = int(self.base_seat_height * scale_factor)
+
+        # Apply absolute minimum dimensions for seats to prevent them becoming unusable
+        min_seat_width = 140
+        min_seat_height = 100
+        seat_width = max(seat_width, min_seat_width)
+        seat_height = max(seat_height, min_seat_height)
+        # No explicit maximum needed due to scale_factor clamp above
+
+        # --- Calculate New Card Dimensions within Seats ---
+        # Scale card size based on the same scale factor, using base card dimensions
+        card_w = self.card_generator.base_card_width
+        card_h = self.card_generator.base_card_height
+        card_scale_multiplier = 0.40 # How much of the base card size to use inside the seat
+        scaled_card_w = int(card_w * card_scale_multiplier * scale_factor)
+        scaled_card_h = int(card_h * card_scale_multiplier * scale_factor)
+        # Apply minimum dimensions for cards within seats
+        min_card_w = 25
+        min_card_h = 35
+        scaled_card_w = max(min_card_w, scaled_card_w)
+        scaled_card_h = max(min_card_h, scaled_card_h)
+        new_card_size = (scaled_card_w, scaled_card_h) # Store the target size for cards in seats
+
+        # --- Reposition and Resize Each Seat Frame ---
+        # Iterate through the defined seat positions
+        for i, pos_info in enumerate(self.seat_positions):
+            if i not in self.seat_frames_widgets: continue # Skip if seat data doesn't exist
+
+            seat_widgets = self.seat_frames_widgets[i]
+            seat_frame = seat_widgets['frame']
+
+            if not seat_frame.winfo_exists(): continue # Skip if frame was destroyed
+
+            # Calculate absolute (x, y) coordinates based on relative position and table dimensions
+            abs_x = pos_info['relx'] * table_width
+            abs_y = pos_info['rely'] * table_height
+
+            # Place the seat frame using calculated position, size, and anchor
+            try:
+                 seat_frame.place_configure(x=int(abs_x), y=int(abs_y),
+                                            width=int(seat_width), height=int(seat_height),
+                                            anchor=pos_info['anchor'])
+            except tk.TclError as e:
+                 print(f"Warning: TclError placing seat {i}: {e}")
+                 continue # Skip updating cards if place failed
+
+            # --- Update Card Images if Size Changed ---
+            # Check if the calculated card size is different from the currently stored size
+            if seat_widgets.get('card_size') != new_card_size:
+                seat_widgets['card_size'] = new_card_size # Store the new target size
+
+                # Attempt to retrieve the current card codes being displayed (best effort)
+                # This avoids needing to store card codes separately in the UI state
+                current_codes = ["??", "??"] # Default if lookup fails
+                try:
+                    # Access the cached image object associated with the label
+                    img1 = seat_widgets['cards'][0].image
+                    img2 = seat_widgets['cards'][1].image
+                    # Search the generator's cache for these image objects to find their codes
+                    # Iterate over a copy of items to avoid issues if cache modified during iteration
+                    for (code, size), img_cached in list(self.card_generator.card_images.items()):
+                         # Use 'is' for object identity comparison
+                         if img_cached is img1: current_codes[0] = code
+                         if img_cached is img2: current_codes[1] = code
+                         # Optimization: break if both found? (might compare same image twice)
+                except Exception as e:
+                     # This lookup can fail if images were never set or cache cleared etc.
+                     # print(f"DEBUG: Could not retrieve current card codes for seat {i} during resize: {e}")
+                     pass # Fallback to "??" is acceptable
+
+                # Call update_player_cards to regenerate/fetch images at the new size
+                self.update_player_cards(i, current_codes)
+
+
+    def _resize_community_cards(self, table_width):
+        """ Resizes community card images based on the current table width. """
+        if not hasattr(self, 'community_card_labels') or not self.community_card_labels:
+            return # Community cards not created yet
+
+        # --- Calculate Scaling Factor ---
+        # Scale based on table width relative to a base design width
+        base_table_width_for_scaling = 800
+        scale_factor = table_width / base_table_width_for_scaling
+        # Clamp scale factor (allow shrinking, limit growth slightly)
+        scale_factor = max(0.7, min(scale_factor, 1.1)) # Example range: 70% to 110%
+
+        # --- Calculate New Card Dimensions ---
+        card_w = self.card_generator.base_card_width
+        card_h = self.card_generator.base_card_height
+        comm_card_multiplier = 0.5 # Base size multiplier for community cards
+        scaled_card_w = int(card_w * comm_card_multiplier * scale_factor)
+        scaled_card_h = int(card_h * comm_card_multiplier * scale_factor)
+
+        # Apply minimum dimensions for community cards
+        min_comm_card_w = 30
+        min_comm_card_h = 45
+        new_size = (max(min_comm_card_w, scaled_card_w), max(min_comm_card_h, scaled_card_h))
+
+        # --- Update Images Only if Size Changed ---
+        if self.community_card_size != new_size:
+            self.community_card_size = new_size # Store the new size
+            # print(f"DEBUG Resize Community Cards to: {new_size}")
+
+            # Attempt to retrieve current codes (similar fragile method as seats)
+            current_codes = ["??"] * 5 # Default if lookup fails
+            try:
+                for idx, label in enumerate(self.community_card_labels):
+                    if label.winfo_exists():
+                        img_current = label.image
+                        # Iterate over cache copy
+                        for (code, size), img_cached in list(self.card_generator.card_images.items()):
+                            if img_cached is img_current:
+                                current_codes[idx] = code
+                                break # Found code for this label
+            except Exception as e:
+                # print(f"DEBUG: Could not retrieve current community card codes during resize: {e}")
+                pass
+
+            # Call the update function with the retrieved codes (or defaults)
+            # This forces regeneration/fetching images at the new 'self.community_card_size'
+            self.update_community_cards(current_codes)
+
+
+    # --- UI Update Methods (Called by game logic) ---
+
+    def update_pot(self, amount):
+        """Updates the pot label text with comma formatting."""
+        if hasattr(self, 'pot_label') and self.pot_label and self.pot_label.winfo_exists():
+             try:
+                  # Format amount with commas for thousands separator
+                  self.pot_label.configure(text=f"Pot: ${amount:,.0f}")
+             except tk.TclError: pass # Ignore errors if widget destroyed during update
+
+
+    def update_player_cards(self, seat_index, cards):
+        """
+        Updates the card images displayed for a specific player seat.
+        Uses the 'card_size' currently stored for that seat.
+        """
+        # Validate seat index
+        if seat_index not in self.seat_frames_widgets:
+            # print(f"Warning: Attempted to update cards for non-existent seat {seat_index}")
+            return
+
+        seat_widgets = self.seat_frames_widgets[seat_index]
+        card_labels = seat_widgets.get('cards')
+        # Get the *current* required card size for this seat from storage
+        card_size = seat_widgets.get('card_size', (20, 30)) # Use stored size, with fallback
+
+        # Ensure card_labels list exists and has two labels
+        if not card_labels or len(card_labels) != 2:
+             print(f"Error: Invalid card labels structure for seat {seat_index}")
              return
 
-
-        if response is True:
-            # Restart game with same config
-            print("Restarting game with the same configuration...")
-            # Need to clean up game window before starting again
-            if self.game_window and self.game_window.winfo_exists():
-                 self.game_window.destroy()
-            self.game_window = None
-
-            if self.env:
-                try: self.env.close()
-                except Exception as e: print(f"Error closing env before restart: {e}")
-                self.env = None
-            # Reset necessary state variables but keep configs and model path
-            self.current_encoded_state = None; self.last_info = {}; self.tournament_running = False
-            # Clear UI references that will be recreated
-            self.seat_frames = {}; self.seat_status_labels = {}; self.seat_action_labels = {}; self.seat_stack_labels = {}; self.seat_showdown_card_labels = {}
-            self.player_card_labels = []; self.community_card_labels = []; self.action_buttons = {}
-            self.pot_label = None; self.turn_label = None; self.player_hand_frame = None; self.status_bar = None; self.showdown_overview_label = None
-
-            # Call _start_game again, which will use existing self.seat_configs
-            # Need to ensure model is reloaded if needed, _start_game handles this
-            self.agent_model = None # Clear loaded model reference
-            self._start_game()
+        # Ensure 'cards' input is a list of exactly 2 card codes (use "??" for missing/invalid)
+        if isinstance(cards, list) and len(cards) == 2:
+            # Ensure elements are strings, replace None or empty strings with "??"
+            display_codes = [str(c) if c else "??" for c in cards]
         else:
-            # Go back to configuration screen
-            print("Returning to configuration screen.")
-            self._reconfigure()
+             # If input is invalid (None, wrong length, etc.), default to two hidden cards
+             display_codes = ["??", "??"]
+             # print(f"Warning: Invalid 'cards' data for seat {seat_index}: {cards}. Displaying hidden.")
 
-    def _reconfigure(self):
-        """ Cleans up the current game state and returns to the configuration window. """
-        print("Reconfiguring game...")
-        self.tournament_running = False # Ensure game loop stops
+        # Update the two card labels for the seat
+        for i, label in enumerate(card_labels):
+            if not label or not label.winfo_exists(): continue # Skip if label widget is gone
 
-        # Destroy the game window if it exists
-        if self.game_window and self.game_window.winfo_exists():
-            self.game_window.destroy()
-        self.game_window = None
+            card_code = display_codes[i]
+            # print(f"DEBUG: Seat {seat_index+1}, Card {i+1}: Code='{card_code}', Size={card_size}") # Reduce noise
 
-        # Close the environment if it exists
-        if self.env:
             try:
-                self.env.close()
-                print("Environment closed.")
+                # Get the card image (cached or newly generated) at the required size
+                card_img = self.card_generator.get_card_image(card_code, size=card_size)
+
+                if card_img:
+                    label.configure(image=card_img)
+                    label.image = card_img # IMPORTANT: Keep reference to prevent garbage collection
+                else:
+                    # This *shouldn't* happen if get_card_image always returns a placeholder
+                    print(f"ERROR: get_card_image returned None for seat {seat_index}, card {i}. Attempting placeholder.")
+                    placeholder = self.card_generator.get_placeholder_image(size=card_size)
+                    if placeholder:
+                         label.configure(image=placeholder, text="")
+                         label.image = placeholder
+                    else: # Absolute fallback if even placeholder fails
+                         label.configure(image='', text="IMG ERR")
+                         label.image = None
+
+            except tk.TclError:
+                 # Handle cases where the label widget might be destroyed between checks
+                 # print(f"Warning: TclError updating card image for seat {seat_index}, card {i}.")
+                 pass
             except Exception as e:
-                print(f"Error closing environment during reconfiguration: {e}")
-        self.env = None
-
-        # Reset game-related state variables
-        self.agent_model = None # Force model reload if needed
-        # Keep self.seat_configs from previous run? No, reconfigure means start fresh.
-        # self.seat_configs = {} # Resetting here might lose defaults, let config window handle it.
-        self.current_encoded_state = None
-        self.human_player_seat = -1
-        self.last_info = {}
-        self.action_list = []
-        self.num_actions = 0
-        self._action_string_to_idx = {}
-
-        # Clear UI widget references
-        self.seat_frames = {}
-        self.seat_status_labels = {}
-        self.seat_action_labels = {}
-        self.seat_stack_labels = {}
-        self.seat_showdown_card_labels = {}
-        self.player_card_labels = []
-        self.community_card_labels = []
-        self.action_buttons = {}
-        self.pot_label = None
-        self.turn_label = None
-        self.player_hand_frame = None
-        self.status_bar = None
-        self.showdown_overview_label = None
-
-        # Re-create the configuration window
-        self._create_config_window()
+                print(f"ERROR updating card image for seat {seat_index}, card {i} (code: {card_code}, size: {card_size}): {e}")
+                import traceback
+                traceback.print_exc()
+                # Attempt to show placeholder on unexpected error
+                try:
+                    placeholder = self.card_generator.get_placeholder_image(size=card_size)
+                    if placeholder:
+                         label.configure(image=placeholder, text="")
+                         label.image = placeholder
+                    else:
+                         label.configure(image='', text="ERR")
+                         label.image = None
+                except Exception as e2:
+                    print(f"ERROR: Failed to get/set placeholder after card update error: {e2}")
+                    label.configure(image='', text="ERR") # Final fallback display
+                    label.image = None
 
 
-# --- Main Execution ---
-if __name__ == "__main__":
-    root = tk.Tk()
-    root.withdraw() # Keep the root window hidden
+    def update_community_cards(self, cards):
+        """
+        Updates the community card images displayed on the table.
+        Uses the 'community_card_size' currently stored in the instance.
+        """
+        # Use the currently calculated community card size
+        card_size = self.community_card_size
+        # print(f"DEBUG: update_community_cards called with cards: {cards}, Size: {card_size}") # Reduce noise
 
-    # Attempt to apply a modern theme
-    try:
-        style = ttk.Style(root)
-        # Try themes in order of preference
-        available_themes = style.theme_names()
-        preferred_themes = ['clam', 'alt', 'default'] # Add more like 'vista', 'xpnative' if needed
-        for theme in preferred_themes:
-            if theme in available_themes:
-                 try:
-                      style.theme_use(theme)
-                      print(f"Using theme: {theme}")
-                      break
-                 except tk.TclError:
-                      print(f"Failed to apply theme: {theme}")
+        # Ensure 'cards' is a list, pad with None up to 5 elements if needed
+        if not isinstance(cards, list): cards = []
+        # Pad with None to ensure 5 elements, then take the first 5
+        display_codes_padded = (cards + [None] * 5)[:5]
+
+        # Iterate through the community card labels
+        for i, label in enumerate(self.community_card_labels):
+            if not label or not label.winfo_exists(): continue # Skip if label is gone
+
+            # Determine card code: use "??" for None or invalid entries in the padded list
+            card_code = str(display_codes_padded[i]) if display_codes_padded[i] else "??"
+
+            try:
+                # Get the card image at the correct size
+                card_img = self.card_generator.get_card_image(card_code, size=card_size)
+
+                if card_img:
+                    label.configure(image=card_img)
+                    label.image = card_img # Keep reference
+                else:
+                    # Should not happen if get_card_image has fallbacks
+                    print(f"ERROR: get_card_image returned None for community card {i}. Attempting placeholder.")
+                    placeholder = self.card_generator.get_placeholder_image(size=card_size)
+                    if placeholder:
+                         label.configure(image=placeholder, text="")
+                         label.image = placeholder
+                    else: # Absolute fallback
+                         label.configure(image='', text="IMG ERR")
+                         label.image = None
+
+            except tk.TclError:
+                 # print(f"Warning: TclError updating community card image {i}.")
+                 pass
+            except Exception as e:
+                print(f"ERROR updating community card image {i} (code: {card_code}, size: {card_size}): {e}")
+                import traceback
+                traceback.print_exc()
+                # Attempt to show placeholder
+                try:
+                    placeholder = self.card_generator.get_placeholder_image(size=card_size)
+                    if placeholder:
+                         label.configure(image=placeholder, text="")
+                         label.image = placeholder
+                    else:
+                         label.configure(image='', text="ERR")
+                         label.image = None
+                except Exception as e2:
+                    print(f"ERROR: Failed to get/set placeholder after comm card update error: {e2}")
+                    label.configure(image='', text="ERR")
+                    label.image = None
+
+
+    def update_player_status(self, seat_index, status, stack, action_text):
+        """Updates the status, stack, and action labels for a player seat."""
+        if seat_index not in self.seat_frames_widgets: return
+
+        widgets = self.seat_frames_widgets[seat_index]
+        # Check if widgets dictionary and the frame widget itself exist
+        if widgets and widgets['frame'].winfo_exists():
+             try:
+                 # Update status label if it exists
+                 if widgets.get('status') and widgets['status'].winfo_exists():
+                     widgets['status'].configure(text=f"{status}")
+                 # Update stack label if it exists, with comma formatting
+                 if widgets.get('stack') and widgets['stack'].winfo_exists():
+                     widgets['stack'].configure(text=f"${stack:,.0f}")
+                 # Update action label if it exists
+                 if widgets.get('action') and widgets['action'].winfo_exists():
+                     widgets['action'].configure(text=f"{action_text}")
+             except tk.TclError:
+                 # Handle cases where a label might be destroyed during update
+                 # print(f"Warning: TclError updating status for seat {seat_index}.")
+                 pass
+
+
+    def highlight_active_player(self, active_seat_index):
+        """Changes the style of the active player's seat frame and resets others."""
+        for i, widgets in self.seat_frames_widgets.items():
+            # Ensure the seat frame widget exists
+            if widgets and widgets.get('frame') and widgets['frame'].winfo_exists():
+                try:
+                    is_human = (i == self.human_player_id)
+                    is_active = (i == active_seat_index)
+
+                    # Determine the correct style based on active status and human status
+                    if is_active:
+                        # Use 'Active' style for the player whose turn it is
+                        style_to_use = 'Active.Seat.TLabelframe'
+                    elif is_human:
+                        # Use the specific 'Human' style if it's the human player but not their turn
+                        style_to_use = 'Human.Seat.TLabelframe'
+                    else:
+                        # Use the default 'Seat' style for inactive opponents
+                        style_to_use = 'Seat.TLabelframe'
+
+                    # Apply the determined style
+                    widgets['frame'].configure(style=style_to_use)
+                except tk.TclError:
+                    # Handle error if widget is destroyed during style update
+                    # print(f"Warning: TclError highlighting seat {i}.")
+                    pass
+
+
+    def update_game_info(self, round_name, dealer, small_blind, big_blind, current_player, to_call):
+        """Updates the labels in the Game Information panel."""
+        # Create a dictionary mapping widget references to their new values
+        ui_elements = {
+            'round': (self.round_value, str(round_name)),
+            'dealer': (self.dealer_value, str(dealer)),
+            'blinds': (self.blinds_value, f"${small_blind:,.0f} / ${big_blind:,.0f}"), # Comma format blinds
+            'current': (self.current_value, str(current_player)),
+            'tocall': (self.tocall_value, f"${to_call:,.0f}") # Comma format amount to call
+        }
+        # Iterate and update each widget safely
+        for key, (widget, value) in ui_elements.items():
+            if widget and widget.winfo_exists(): # Check if widget exists
+                try:
+                    widget.configure(text=value) # Update the text
+                except tk.TclError: pass # Ignore errors if widget destroyed during update
+
+
+    def update_action_buttons(self, enable):
+        """Enables or disables ALL action buttons uniformly."""
+        state = tk.NORMAL if enable else tk.DISABLED
+        for action_name, button in self.action_buttons.items():
+            if button and button.winfo_exists():
+                try:
+                    button.configure(state=state)
+                except tk.TclError: pass # Ignore errors if button destroyed
+
+
+    def update_legal_actions_display(self, legal_actions, amount_to_call=0):
+        """
+        Enables/disables action buttons based on the list of legal action strings
+        provided by the environment, also considering the amount to call.
+        """
+        # If it's not the human's turn, disable all buttons and return
+        if not self.is_human_turn:
+            self.update_action_buttons(False)
+            return
+
+        # Ensure legal_actions is a set for efficient lookup
+        if not isinstance(legal_actions, (list, set)):
+            print(f"Warning: Invalid legal_actions received: {legal_actions}")
+            legal_actions_set = set() # Treat as no legal actions
         else:
-             print("Preferred themes not found or failed to apply, using system default.")
+             legal_actions_set = set(legal_actions)
 
-    except tk.TclError:
-        print("Warning: Failed to initialize ttk themes.")
+        # --- Initial Enable/Disable based on raw legal_actions ---
+        for action_name, button in self.action_buttons.items():
+            if button and button.winfo_exists():
+                is_legal = action_name in legal_actions_set
+                button_state = tk.NORMAL if is_legal else tk.DISABLED
+                try:
+                     button.configure(state=button_state)
+                except tk.TclError: pass # Ignore if button destroyed
 
-    # Create and run the application instance
-    app = PokerApp(root)
-    root.mainloop() # Start the Tkinter event loop
-    print("Application exited.")
+        # --- Refined Logic: Check vs Call ---
+        # Get the Check and Call buttons if they exist
+        check_button = self.action_buttons.get('check')
+        call_button = self.action_buttons.get('call')
+
+        try:
+            # Only apply refinement if both buttons exist
+            if check_button and check_button.winfo_exists() and call_button and call_button.winfo_exists():
+                can_check = 'check' in legal_actions_set
+                can_call = 'call' in legal_actions_set
+
+                if amount_to_call > 0:
+                    # If there's an amount to call:
+                    # - Disable 'Check' button, even if technically legal from env.
+                    # - Ensure 'Call' button is enabled if it was legal.
+                    if can_check: check_button.configure(state=tk.DISABLED)
+                    # Ensure call button state reflects its legality if check was disabled
+                    # if can_call: call_button.configure(state=tk.NORMAL) # This line might re-enable call incorrectly if it wasn't legal
+
+                else: # amount_to_call is 0
+                    # If amount to call is 0:
+                    # - Disable 'Call' button, even if technically legal from env.
+                    # - Ensure 'Check' button is enabled if it was legal.
+                    if can_call: call_button.configure(state=tk.DISABLED)
+                    # Ensure check button state reflects its legality if call was disabled
+                    # if can_check: check_button.configure(state=tk.NORMAL) # This line might re-enable check incorrectly
+
+        except tk.TclError:
+             # print("Warning: TclError during check/call refinement.")
+             pass # Ignore if widgets destroyed during logic
+        except Exception as e:
+             print(f"Error during check/call refinement: {e}")
+
+
+    # --- Seat Configuration Dialog ---
+
+    def _show_seat_config_dialog(self):
+        """Displays a Toplevel window for configuring player seats and AI models."""
+        # Create the Toplevel window
+        config_window = tk.Toplevel(self.root)
+        config_window.title("Configure Seats")
+        config_window.transient(self.root) # Keep window on top of main app
+        config_window.grab_set() # Make it modal (block interaction with main window)
+        config_window.resizable(False, False) # Prevent resizing the dialog
+        # Use a theme-consistent background color
+        config_window.configure(background=self.theme.COLORS.get('bg_dialog', self.theme.COLORS['bg_main']))
+
+        # Main content frame inside the dialog
+        content_frame = ttk.Frame(config_window, padding="15", style='TFrame')
+        content_frame.pack(expand=True, fill="both")
+
+        # Dialog Title
+        ttk.Label(content_frame, text="Configure Player Seats", style='Header.TLabel').pack(pady=(0, 20))
+
+        # Frame to hold the rows of seat options
+        options_frame = ttk.Frame(content_frame, style='TFrame')
+        options_frame.pack(pady=5)
+
+        # --- Data Structures for UI Elements ---
+        # Store Tkinter variables and widget references for each seat row
+        seat_vars = [] # List of tk.StringVar holding the selected seat type (e.g., 'player', 'model')
+        checkpoint_vars = [] # List of tk.StringVar holding the checkpoint file path
+        checkpoint_widgets = [] # List of dicts: {'entry': ttk.Entry, 'button': ttk.Button}
+
+        # --- Helper Function: Browse for Checkpoint File ---
+        def browse_checkpoint(index, cp_var):
+            """Opens a file dialog to select a checkpoint file (.pt) and updates the cp_var."""
+            # Determine initial directory for browsing (prefer checkpoints folder)
+            script_dir = os.path.dirname(__file__) or "."
+            initial_dir = os.path.abspath(os.path.join(script_dir, '..', 'checkpoints'))
+            # Fallback to user's home directory if checkpoints folder doesn't exist
+            if not os.path.isdir(initial_dir): initial_dir = os.path.expanduser("~")
+
+            filepath = filedialog.askopenfilename(
+                title=f"Select Model Checkpoint for Seat {index+1}",
+                filetypes=[("PyTorch Checkpoints", "*.pt"), ("All Files", "*.*")],
+                initialdir=initial_dir,
+                parent=config_window # Ensure dialog is modal relative to the config window itself
+            )
+            # If a file was selected, update the corresponding StringVar
+            if filepath:
+                cp_var.set(filepath)
+
+        # --- Create Configuration Row for Each Player ---
+        for i in range(NUM_PLAYERS):
+            row_frame = ttk.Frame(options_frame, style='TFrame')
+            row_frame.pack(fill=tk.X, pady=4)
+
+            # Seat Label (e.g., "Seat 1:")
+            if i == 1:
+                ttk.Label(row_frame, text=f"Player", width=8).pack(side=tk.LEFT, padx=(0, 10))
+            else:
+                ttk.Label(row_frame, text=f"Seat {i+1}:", width=8).pack(side=tk.LEFT, padx=(0, 10))
+
+            # --- Seat Type Dropdown ---
+            current_type = self.seat_config.get(i, 'empty') # Get current type from app state
+            var = tk.StringVar(value=current_type) # Create StringVar for this seat's type
+            seat_vars.append(var) # Store the variable
+
+            # Get available seat type options from the manager
+            options = self.seat_config_manager.get_options() # e.g., ['empty', 'player', 'model', 'random']
+
+            # Ensure the currently stored type is valid, default to 'empty' if not
+            if current_type not in options:
+                 print(f"Warning: Saved type '{current_type}' for seat {i+1} is invalid. Resetting to 'empty'.")
+                 current_type = 'empty'
+                 var.set(current_type)
+
+            # Configure dropdown based on whether it's the human player's seat
+            if i == self.human_player_id:
+                # Human player seat is fixed to 'player'
+                human_opts = ["player"]
+                if var.get() != "player": var.set("player") # Ensure variable is correct
+                dropdown = ttk.OptionMenu(row_frame, var, "player", *human_opts)
+                dropdown.configure(state=tk.DISABLED) # Disable changing the human player type
+            else:
+                # Other seats can be configured using all available options
+                dropdown = ttk.OptionMenu(row_frame, var, current_type, *options)
+
+            dropdown.pack(side=tk.LEFT, padx=5)
+
+            # --- Checkpoint Path Entry and Button (Conditional) ---
+            # Create StringVar for the checkpoint path for this seat
+            cp_var = tk.StringVar(value=self.checkpoint_paths.get(i) or "") # Get saved path or empty string
+            checkpoint_vars.append(cp_var) # Store the variable
+
+            # Create Entry and Button widgets (initially packed, state controlled by callback)
+            cp_entry = ttk.Entry(row_frame, textvariable=cp_var, width=40, state=tk.DISABLED)
+            cp_browse = ttk.Button(row_frame, text="...", width=3, state=tk.DISABLED,
+                                   # Pass the specific cp_var to the browse command using lambda
+                                   command=lambda idx=i, var=cp_var: browse_checkpoint(idx, var))
+
+            # Pack widgets: Browse button first (right), then Entry fills remaining space
+            cp_browse.pack(side=tk.RIGHT, padx=(5, 0))
+            cp_entry.pack(side=tk.RIGHT, padx=(5, 0), fill=tk.X, expand=True)
+
+            # Store references to these widgets
+            checkpoint_widgets.append({'entry': cp_entry, 'button': cp_browse})
+
+            # --- Callback Function to Enable/Disable Checkpoint Widgets ---
+            # Uses a factory function (create_toggle_callback) to correctly capture loop variables (index, var, widgets)
+            def create_toggle_callback(index, seat_type_var, widgets_dict):
+                """Creates a callback function that knows its specific index, variable, and widgets."""
+                def toggle_widgets_state(*args): # Callback signature for trace_add
+                     entry_widget = widgets_dict['entry']
+                     button_widget = widgets_dict['button']
+                     # Check if widgets still exist before configuring them
+                     if not entry_widget.winfo_exists() or not button_widget.winfo_exists(): return
+
+                     # Enable entry/button only if seat type is 'model' AND PyTorch is available
+                     is_model_seat = seat_type_var.get() == 'model'
+                     enable_state = tk.NORMAL if (is_model_seat and torch) else tk.DISABLED
+
+                     entry_widget.configure(state=enable_state)
+                     button_widget.configure(state=enable_state)
+
+                     # Add a visual cue if model selected but torch unavailable? (Optional)
+                     # if is_model_seat and not torch:
+                     #     entry_widget.configure(foreground='gray') # Example
+                     # else:
+                     #      entry_widget.configure(foreground=self.theme.COLORS['text_input'])
+
+                return toggle_widgets_state
+
+            # Add trace to the seat type variable (only for non-human seats)
+            if i != self.human_player_id:
+                callback = create_toggle_callback(i, var, checkpoint_widgets[i])
+                var.trace_add("write", callback) # Call callback whenever the dropdown value changes
+                # Call initially to set the correct state based on the loaded config
+                callback()
+            else:
+                 # Ensure checkpoint entry/button are always disabled for the human player seat
+                 cp_entry.configure(state=tk.DISABLED)
+                 cp_browse.configure(state=tk.DISABLED)
+
+
+        # --- Dialog Action Buttons (Apply/Cancel) ---
+        button_frame = ttk.Frame(content_frame, style='TFrame')
+        button_frame.pack(pady=(25, 5)) # Add space above the buttons
+
+        def apply_config():
+            """Validates the selected configuration, applies it to the app state, and closes the dialog."""
+            temp_config = {} # Temporary dict to store new seat types {id: type}
+            temp_paths = {} # Temporary dict to store new checkpoint paths {id: path or None}
+            selected_types = [] # List of selected types for validation check
+
+            # Read values from the UI variables into temporary storage
+            for idx, seat_type_var in enumerate(seat_vars):
+                seat_type = seat_type_var.get()
+                temp_config[idx] = seat_type
+                selected_types.append(seat_type) # Collect type for validation
+
+                # Get checkpoint path only if seat type is 'model'
+                if seat_type == 'model':
+                    path = checkpoint_vars[idx].get().strip() # Get path from corresponding StringVar
+                    # Basic check if path exists (optional, but helpful)
+                    if path and not os.path.exists(path):
+                         # Warn user if path specified but doesn't exist
+                         messagebox.showwarning("Path Warning",
+                                                f"Checkpoint path for Seat {idx+1} does not exist:\n{path}\n\nModel loading will likely fail.",
+                                                parent=config_window) # Ensure warning is modal to dialog
+                         temp_paths[idx] = path # Store the invalid path anyway
+                    elif path:
+                         temp_paths[idx] = path # Store the valid path
+                    else:
+                         temp_paths[idx] = None # Store None if path is empty
+                         # Optionally warn if type is 'model' but no path is provided
+                         messagebox.showwarning("Path Missing",
+                                                f"Seat {idx+1} is set to 'Model' but no checkpoint path is provided.",
+                                                parent=config_window)
+                else:
+                    temp_paths[idx] = None # No path needed for non-model types
+
+            # --- Validate the overall configuration ---
+            # Example validation: Ensure at least one opponent is selected
+            is_valid, message = self.seat_config_manager.validate_config(selected_types)
+            if not is_valid:
+                messagebox.showerror("Configuration Error", message, parent=config_window)
+                return # Stop processing if validation fails
+
+            # --- Apply Configuration to Main App State ---
+            self.seat_config = temp_config
+            self.checkpoint_paths = temp_paths
+            print("Seat configuration updated:", self.seat_config)
+            print("Checkpoint paths updated:", self.checkpoint_paths)
+
+            config_window.destroy() # Close the configuration dialog
+
+            # --- Ask User to Restart ---
+            # Prompt user if they want to start a new tournament with the applied settings
+            if messagebox.askyesno("Restart Tournament?",
+                                   "Apply new seat configuration and start a new tournament?",
+                                   parent=self.root): # Parent should be main window
+                self.setup_game() # Re-run the setup process with the new config/paths
+
+        # Create Apply and Cancel buttons
+        apply_btn = ttk.Button(button_frame, text="Apply & Restart", command=apply_config, style='Accent.TButton') # Use accent style for apply
+        apply_btn.pack(side=tk.LEFT, padx=10)
+
+        cancel_btn = ttk.Button(button_frame, text="Cancel", command=config_window.destroy)
+        cancel_btn.pack(side=tk.LEFT, padx=10)
+
+        # --- Finalize Dialog ---
+        config_window.update_idletasks() # Ensure window dimensions are calculated before centering
+
+        # Center the dialog relative to the main application window
+        root_x = self.root.winfo_rootx() # Get main window's screen X
+        root_y = self.root.winfo_rooty() # Get main window's screen Y
+        root_w = self.root.winfo_width() # Get main window's width
+        root_h = self.root.winfo_height() # Get main window's height
+        dlg_w = config_window.winfo_width() # Get dialog's width
+        dlg_h = config_window.winfo_height() # Get dialog's height
+
+        # Calculate position for top-left corner of dialog
+        x = root_x + (root_w - dlg_w) // 2
+        y = root_y + (root_h - dlg_h) // 2
+        config_window.geometry(f"+{x}+{y}") # Set dialog position
+
+        config_window.focus_set() # Set focus to the dialog window
+        config_window.wait_window() # Wait until the dialog is closed before returning
+
+
+    def run(self):
+        """Starts the Tkinter main event loop."""
+        print("Starting Poker Application UI...")
+        self.root.mainloop() # Enter the Tkinter event loop
+
+
+# --- Main Execution Block ---
+if __name__ == "__main__":
+    # This block runs only when the script is executed directly
+    root = tk.Tk() # Create the main Tkinter window instance
+    root.withdraw() # Hide the main window initially until setup is complete
+    app = PokerApp(root) # Create the application instance
+    # The main window is shown via root.deiconify() at the end of app.__init__
+    app.run() # Start the application's main loop

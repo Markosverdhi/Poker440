@@ -69,8 +69,8 @@ class Train:
         self.learning_rate = 1e-4
         self.gamma = 0.99 # Discount factor
         self.target_update_freq = 500 # Update target less frequently? (Adjust based on steps/tournament)
-        self.opponent_update_freq = 50 # Tournaments between opponent updates
-        self.checkpoint_save_freq = 50 # Tournaments between checkpoints
+        self.opponent_update_freq = 500 # Tournaments between opponent updates
+        self.checkpoint_save_freq = 1000 # Tournaments between checkpoints
         self.metrics_save_freq = 100 # Tournaments between metric saves
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -297,27 +297,25 @@ class Train:
             # Log results for the completed tournament
             episode_rewards.append(tournament_reward); avg_reward = np.mean(episode_rewards[-100:]) if episode_rewards else 0.0; current_epsilon = epsilon_by_frame(global_step)
             metrics_list.append({'episode': episode, 'reward': tournament_reward, 'avg_reward': avg_reward, 'steps': tournament_agent_steps, 'epsilon': current_epsilon})
-            if episode % 10 == 0 or episode == self.num_episodes: print(f"T: {episode}, AgentSteps: {tournament_agent_steps}, T-Reward: {tournament_reward:.2f}, Avg T-Rew: {avg_reward:.2f}, Eps: {current_epsilon:.4f}, GlobalStep: {global_step}")
+            if episode % 100 == 0 or episode == self.num_episodes: print(f"T: {episode}, AgentSteps: {tournament_agent_steps}, T-Reward: {tournament_reward:.2f}, Avg T-Rew: {avg_reward:.2f}, Eps: {current_epsilon:.4f}, GlobalStep: {global_step}")
 
             # --- Opponent Updates, Checkpointing, Metrics Saving ---
-            if episode > 0:
-                if episode % self.opponent_update_freq == 0:
-                    update_opponent_id = opponent_ids[self.current_update_index]; policy_type = "model"; # ... (rest of opponent update logic unchanged) ...
-                    if update_opponent_id == 1:
-                         if self.variable_mode and episode % 1000 == 0: policy_type = random.choice(["model", "random"]); print(f"Variable mode: Switching Opponent 1 policy type randomly to '{policy_type}' at T {episode}")
-                         elif self._in_range(episode, self.random_range): policy_type = "random"; print(f"Random range active: Setting Opponent 1 policy type to 'random' for T {episode}")
-                    self.update_opponent_policy(update_opponent_id, policy_type, self.env, agent_action_list); self.current_update_index = (self.current_update_index + 1) % len(opponent_ids)
-                if episode % self.checkpoint_save_freq == 0:
-                     checkpoint_path = os.path.join(self.checkpoint_dir, f"checkpoint_{episode}.pt");
-                     try: save_dict = { 'episode': episode, 'global_step': global_step, 'agent_state_dict': agent.state_dict(), 'target_net_state_dict': target_net.state_dict(), 'optimizer_state_dict': optimizer.state_dict() }; torch.save(save_dict, checkpoint_path); print(f"--- Saved checkpoint to {checkpoint_path} (T {episode}) ---"); last_checkpoint_episode = episode
-                     except Exception as e: print(f"Error saving checkpoint: {e}")
-                if episode % self.metrics_save_freq == 0 or episode == self.num_episodes:
-                     if metrics_list:
-                         metrics_file = os.path.join(self.checkpoint_dir, "training_metrics.csv"); is_new_file = not os.path.exists(metrics_file)
-                         try:
-                              with open(metrics_file, "a", newline="") as csvfile: fieldnames = ['episode', 'reward', 'avg_reward', 'steps', 'epsilon']; writer = csv.DictWriter(csvfile, fieldnames=fieldnames);
-                              if is_new_file: writer.writeheader(); writer.writerows(metrics_list); print(f"--- Metrics saved to {metrics_file} (Up to T {episode}) ---"); metrics_list = []
-                         except IOError as e: print(f"Error saving metrics: {e}")
+            if episode % self.metrics_save_freq == 0 or episode == self.num_episodes:
+                if metrics_list:
+                    metrics_file = os.path.join(self.checkpoint_dir, "training_metrics.csv")
+                    is_new_file = not os.path.exists(metrics_file)
+                    try:
+                        # open the file and keep it open through all writer calls
+                        with open(metrics_file, "a", newline="") as csvfile:
+                            fieldnames = ['episode', 'reward', 'avg_reward', 'steps', 'epsilon']
+                            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                            if is_new_file:
+                                writer.writeheader()
+                            writer.writerows(metrics_list)
+                        print(f"--- Metrics saved to {metrics_file} (Up to T {episode}) ---")
+                        metrics_list = []
+                    except IOError as e:
+                        print(f"Error saving metrics: {e}")
         # --- End of Training (Outer loop) ---
 
         # --- Final Saving ---

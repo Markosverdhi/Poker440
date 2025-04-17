@@ -1,23 +1,7 @@
-# filename: main.py
-"""
-Unified interface for running Poker RL Agent commands: train, simulate, analyze, ui.
-
-MODIFIED (Structure & UI Integration):
-- Updated imports to work with the new folder structure (poker_rl_core, scripts, analysis).
-- Added a 'ui' subcommand to launch the Tkinter GUI (main_ui.py).
-- Refactored 'train' command to directly import and call the Train class.
-- Kept sys.argv rebuilding for 'simulate' and 'analyze' for compatibility with
-  their current internal argparse, but updated import paths. Added notes
-  about potential future refactoring for those scripts.
-"""
-
 import argparse
 import sys
 import os
 
-# Add the project root directory to the Python path to allow imports like
-# from poker_rl_core import ... or from scripts import ...
-# This assumes main.py is in the project root (PokerBotRL).
 project_root = os.path.dirname(os.path.abspath(__file__))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -25,7 +9,7 @@ if project_root not in sys.path:
 def main():
     parser = argparse.ArgumentParser(
         description="Poker RL Agent: Train, simulate, analyze, or run the UI.",
-        formatter_class=argparse.RawTextHelpFormatter # Keep formatting in help messages
+        formatter_class=argparse.RawTextHelpFormatter
     )
     subparsers = parser.add_subparsers(dest="command", required=True,
                                        help="Sub-command to run:\n"
@@ -34,7 +18,6 @@ def main():
                                             "  analyze  - Analyze detailed simulation logs.\n"
                                             "  ui       - Run the graphical user interface.")
 
-    # --- Subparser for training ---
     train_parser = subparsers.add_parser("train", help="Train the RL agent.")
     train_parser.add_argument(
         "--episodes", type=int, default=100000,
@@ -53,7 +36,6 @@ def main():
         help="Path to an existing model checkpoint file (.pt) to resume training from."
     )
 
-    # --- Subparser for simulation/evaluation ---
     simulate_parser = subparsers.add_parser("simulate", help="Simulate/evaluate the trained RL agent.")
     simulate_parser.add_argument(
         "--checkpoint", type=str, required=True,
@@ -76,14 +58,11 @@ def main():
         "--detailed_log", type=str, default="detailed_simulation_log.csv",
         help="Path to the CSV file to store detailed game state and action logs."
     )
-    # Add output_csv argument consistent with simulate.py's internal parsing
     simulate_parser.add_argument(
         "--output_csv", type=str, default="simulation_results.csv",
          help="Path to the CSV file to store simulation summary results."
     )
 
-
-    # --- Subparser for decision analysis ---
     analyze_parser = subparsers.add_parser("analyze", help="Analyze detailed simulation logs and compare decisions.")
     analyze_parser.add_argument(
         "--detailed_log", type=str, default="detailed_simulation_log.csv", required=True,
@@ -93,31 +72,39 @@ def main():
         "--output_analysis", type=str, default="decision_analysis_summary.csv",
         help="Path to save the analysis summary."
     )
-    # Add agent_id argument consistent with decision_analysis.py's internal parsing
     analyze_parser.add_argument(
         "--agent_id", type=int, default=1,
         help="Player ID (1-based) of the agent to analyze."
     )
 
-    # --- Subparser for UI ---
     ui_parser = subparsers.add_parser("ui", help="Run the graphical user interface.")
-    # Add arguments if the UI needs them (e.g., default checkpoint path)
-    # ui_parser.add_argument("--checkpoint", type=str, help="Optional path to a model checkpoint for the UI.")
+    ui_parser.add_argument(
+        "--theme", type=str, default="dark", choices=["dark", "light"],
+        help="UI theme to use (dark or light)"
+    )
+    ui_parser.add_argument(
+        "--animation_speed", type=float, default=1.0,
+        help="Animation speed multiplier (0.5 = half speed, 2.0 = double speed)"
+    )
+    ui_parser.add_argument(
+        "--fullscreen", action="store_true",
+        help="Launch the UI in fullscreen mode"
+    )
 
     args = parser.parse_args()
 
-    # --- Execute Commands ---
     if args.command == "train":
         try:
-            # Import the Train class from the scripts folder
             from Scripts.train import Train
-        except ImportError as e:
-            print(f"Error: Could not import Train from scripts.train: {e}")
-            print("Ensure the folder structure is correct and __init__.py exists if needed.")
-            sys.exit(1)
+        except ImportError:
+            try:
+                from Scripts.train import Train
+            except ImportError as e:
+                print(f"Error: Could not import Train: {e}")
+                print("Ensure the folder structure is correct and __init__.py exists if needed.")
+                sys.exit(1)
 
         print("Starting training process...")
-        # Initialize Train directly with argparse arguments.
         trainer = Train(
             episodes=args.episodes,
             random_range=args.random,
@@ -129,9 +116,7 @@ def main():
 
     elif args.command == "simulate":
         print("Starting simulation process...")
-        # NOTE: This still uses sys.argv rebuilding. Ideally, simulate.py
-        # should be refactored to have a function that accepts arguments directly.
-        new_argv = [sys.argv[0]] # Script name (remains simulate.py for its internal parser)
+        new_argv = [sys.argv[0]]
         new_argv += ["--checkpoint", args.checkpoint]
         new_argv += ["--episodes", str(args.episodes)]
         new_argv += ["--opponent", args.opponent]
@@ -143,60 +128,60 @@ def main():
              new_argv += ["--output_csv", args.output_csv]
 
         original_argv = sys.argv
-        # Set the first element to the actual simulate script path for its argparse
-        simulate_script_path = os.path.join(project_root, 'scripts', 'simulate.py')
+        simulate_script_path = os.path.join(project_root, 'Back_End', 'Scripts', 'simulate.py')
         sys.argv = [simulate_script_path] + new_argv[1:]
 
         try:
-            # Import the main function from the simulate script
-            from Scripts.simulate import main as simulate_main
-            simulate_main() # Call the main function which handles its own argparse
+            try:
+                from Scripts.simulate import main as simulate_main
+            except ImportError:
+                from Scripts.simulate import main as simulate_main
+            simulate_main()
         except ImportError as e:
-             print(f"Error: Could not import main from scripts.simulate: {e}")
+             print(f"Error: Could not import simulate: {e}")
              print("Ensure the folder structure is correct and __init__.py exists if needed.")
              sys.exit(1)
         except SystemExit as e:
-             # Catch SystemExit from simulate's argparse if args are invalid
              if e.code != 0: print(f"Exiting due to error in simulate script (code: {e.code}).")
         finally:
-             sys.argv = original_argv # Restore original argv
+             sys.argv = original_argv
         print("Simulation finished.")
 
     elif args.command == "analyze":
         print("Starting analysis process...")
-        # NOTE: This still uses sys.argv rebuilding. Ideally, decision_analysis.py
-        # should be refactored to have a function that accepts arguments directly.
-        new_argv = [sys.argv[0]] # Script name (remains decision_analysis.py for its internal parser)
+        new_argv = [sys.argv[0]]
         new_argv += ["--detailed_log", args.detailed_log]
         new_argv += ["--output_analysis", args.output_analysis]
         new_argv += ["--agent_id", str(args.agent_id)]
 
         original_argv = sys.argv
-        # Set the first element to the actual analysis script path for its argparse
-        analyze_script_path = os.path.join(project_root, 'analysis', 'decision_analysis.py')
+        analyze_script_path = os.path.join(project_root, 'Back_End', 'Scripts', 'decision_analysis.py')
         sys.argv = [analyze_script_path] + new_argv[1:]
 
         try:
-            # Import the main function from the analysis script
-            from Scripts.decision_analysis import main as analyze_main
-            analyze_main() # Call the main function which handles its own argparse
+            try:
+                from Scripts.decision_analysis import main as analyze_main
+            except ImportError:
+                from Scripts.decision_analysis import main as analyze_main
+            analyze_main()
         except ImportError as e:
-             print(f"Error: Could not import main from analysis.decision_analysis: {e}")
+             print(f"Error: Could not import decision_analysis: {e}")
              print("Ensure the folder structure is correct and __init__.py exists if needed.")
              sys.exit(1)
         except SystemExit as e:
-             # Catch SystemExit from analyze's argparse if args are invalid
              if e.code != 0: print(f"Exiting due to error in analysis script (code: {e.code}).")
         finally:
-             sys.argv = original_argv # Restore original argv
+             sys.argv = original_argv
         print("Analysis finished.")
 
     elif args.command == "ui":
-        print("Launching Poker UI...")
+        print("Launching Enhanced Poker UI...")
         try:
-            # Import Tkinter and the PokerApp class
             import tkinter as tk
-            from Front_End.main_ui import PokerApp
+            try:
+                from Front_End.main_ui import PokerApp
+            except ImportError:
+                from Front_End.main_ui import PokerApp
         except ImportError as e:
             print(f"Error: Could not import UI components: {e}")
             print("Ensure tkinter is installed and the folder structure is correct.")
@@ -204,31 +189,28 @@ def main():
 
         try:
             root = tk.Tk()
-            root.withdraw() # Hide the main root window
-
-            # Optional: Apply theme if needed (copied from main_ui.py)
-            try:
-                from tkinter import ttk
-                style = ttk.Style(root)
-                available_themes = style.theme_names()
-                preferred_themes = ['clam', 'alt', 'default']
-                for theme in preferred_themes:
-                    if theme in available_themes:
-                         try: style.theme_use(theme); break
-                         except tk.TclError: pass
-            except Exception: pass # Ignore styling errors
-
-            app = PokerApp(root) # Create the application instance
-            root.mainloop() # Start the Tkinter event loop
+            root.withdraw()
+            
+            root.title("Enhanced Poker Game")
+            
+            if args.fullscreen:
+                root.attributes('-fullscreen', True)
+            
+            app = PokerApp(root)
+            
+            if hasattr(app, 'animation_manager') and hasattr(args, 'animation_speed'):
+                app.animation_manager.set_animation_speed(args.animation_speed)
+            
+            root.deiconify()
+            root.mainloop()
         except Exception as e:
-            print(f"Error launching UI: {e}")
+            print(f"Error launching enhanced UI: {e}")
             import traceback
             traceback.print_exc()
             sys.exit(1)
         print("UI closed.")
 
     else:
-        # This case should not be reached due to subparsers(required=True)
         parser.print_help()
 
 if __name__ == "__main__":

@@ -1,26 +1,3 @@
-# filename: envs.py
-"""
-Poker Environment for Reinforcement Learning (Tournament Structure)
-
-Implements a Gymnasium environment where:
-- An episode represents a full multi-round tournament.
-- Rewards are potentially given per round via the info dict.
-- Termination occurs when the agent busts or wins the tournament.
-
-MODIFIED (Round Start Trigger):
-- Modified step() to explicitly check if self.round_over is True at the
-  very beginning. If so, it immediately attempts to start a new round
-  (or handles tournament end) before processing any action. This ensures
-  transitions after folds work correctly.
-
-MODIFIED (Empty Seats & All-in Runout):
-- Modified __init__ and reset to accept and use seat_config, initializing
-  stacks only for non-empty seats.
-- Modified step() to detect when betting is closed and all remaining players
-  are all-in. In this scenario, it now automatically deals the remaining
-  community cards (flop, turn, river) within the same step.
-"""
-
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
@@ -33,60 +10,16 @@ SUITS = ['H', 'D', 'C', 'S']
 RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
 DECK = [r + s for s in SUITS for r in RANKS]
 
-# --- Placeholder Hand Evaluation ---
-# Replace this with a proper poker hand evaluator
-def evaluate_hand(hole_cards, community_cards):
-    """ Placeholder function to evaluate hand strength. """
-    # Combine hole and community cards
-    all_cards = hole_cards + community_cards
-    if not all_cards:
-        return 0, "No Cards" # No score if no cards
-
-    # Extremely simplified evaluation: Count pairs/ranks
-    ranks = [card[:-1] for card in all_cards] # Get ranks '2', 'T', 'A' etc.
-    rank_counts = Counter(ranks)
-    score = 0
-    description = "High Card"
-
-    pairs = 0
-    trips = 0
-    quads = 0
-    max_count = 0
-    # Add simple rank value bonus (Ace=14, King=13...)
-    rank_values = {'A': 14, 'K': 13, 'Q': 12, 'J': 11, 'T': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3, '2': 2}
-
-    for rank, count in rank_counts.items():
-        rank_val = rank_values.get(rank, 0)
-        if count == 2: pairs += 1; score = max(score, 100 + rank_val); description="One Pair" # Add rank value
-        if count == 3: trips += 1; score = max(score, 300 + rank_val); description="Three of a Kind"
-        if count == 4: quads += 1; score = max(score, 700 + rank_val); description="Four of a Kind"
-        max_count = max(max_count, count)
-
-    try:
-        # Add base score based on highest card to differentiate high card hands
-        hole_ranks = [card[:-1] for card in hole_cards]
-        if hole_ranks:
-             score = max(score, max(rank_values.get(r, 0) for r in hole_ranks))
-    except Exception:
-        pass # Ignore errors in placeholder
-
-    # Check for two pair / full house after rank scores are potentially added
-    if trips == 1 and pairs >= 1: score = max(score, 600); description="Full House" # FH beats Trips
-    elif pairs >= 2: score = max(score, 200); description="Two Pair" # Two Pair beats One Pair
-
-    # Ensure descriptions match final score category
-    if score >= 700: description = "Four of a Kind"
-    elif score >= 600: description = "Full House"
-    # Add placeholder checks for Flush/Straight here if needed
-    elif score >= 300: description = "Three of a Kind"
-    elif score >= 200: description = "Two Pair"
-    elif score >= 100: description = "One Pair"
-    else: description = "High Card"
-
-
-    # Return score and a simple description
-    return score, description
-# --- End Placeholder ---
+try:
+    # Use the improved evaluator
+    from .improved_hand_evaluator import evaluate_hand as evaluate_hand_improved
+except ImportError:
+    print("Warning: Could not import improved_hand_evaluator. Using placeholder.")
+    # Fallback placeholder if import fails
+    def evaluate_hand_improved(hole_cards, community_cards):
+        # Extremely simplified placeholder
+        score = len(hole_cards) + len(community_cards)
+        return score, f"Placeholder Score: {score}"
 
 
 class BaseFullPokerEnv(gym.Env):
@@ -153,11 +86,12 @@ class BaseFullPokerEnv(gym.Env):
         # --- Observation Space Definition ---
         # Import the dimension defined in utils.py
         try:
+            # Ensure relative import works if envs.py is in Back_End
             from .constants import NEW_STATE_DIM
             self.observation_space_dim = NEW_STATE_DIM
         except ImportError:
-            print("Warning: Could not import NEW_STATE_DIM from utils. Using default 333.")
-            self.observation_space_dim = 333 # Fallback, ensure utils.py is updated
+            print("Warning: Could not import NEW_STATE_DIM from .constants. Using default 333.")
+            self.observation_space_dim = 333 # Fallback, ensure constants.py is accessible
 
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(self.observation_space_dim,), dtype=np.float32)
 
@@ -196,7 +130,8 @@ class BaseFullPokerEnv(gym.Env):
 
         # Find index of start_id in the playing player list (circular)
         try:
-            start_idx = playing_players.index(start_id)
+            current_start_id = start_id if start_id is not None else self.button_pos # Handle None case
+            start_idx = playing_players.index(current_start_id)
         except ValueError: # start_id not in playing_players (e.g., was empty or invalid)
             # Fallback: find the first active player after the button among playing players
             current_id = self.button_pos
@@ -296,6 +231,12 @@ class BaseFullPokerEnv(gym.Env):
         active_list_sorted = sorted(list(self.active_players_in_round))
         num_active_in_round = len(active_list_sorted)
 
+        # Ensure there are enough active players to assign blinds
+        if num_active_in_round < 2:
+             print("Error: Less than 2 active players to assign blinds. Ending tournament.")
+             self.tournament_over = True
+             return
+
         button_idx_in_active = -1
         try:
              button_idx_in_active = active_list_sorted.index(self.button_pos)
@@ -354,7 +295,7 @@ class BaseFullPokerEnv(gym.Env):
                 self.stacks[i] = 0 # Ensure empty seats have 0 stack
 
         # Random initial button among playing players
-        self.button_pos = random.choice(playing_players)
+        self.button_pos = random.choice(playing_players) if playing_players else 0
 
         self.tournament_over = False
         self.round_over = True # Ensure a new round starts
@@ -368,6 +309,7 @@ class BaseFullPokerEnv(gym.Env):
              observation = self._get_obs(self.agent_id) # Get obs even if over
              info = self._get_info(round_over=True) # Indicate round is also over
              info['error'] = "Tournament ended immediately on reset."
+             info['terminated'] = True # Explicitly set terminated flag
         else:
              observation = self._get_obs(self.agent_id)
              info = self._get_info()
@@ -523,7 +465,8 @@ class BaseFullPokerEnv(gym.Env):
             if total_player_bet > max_bet_on_table: # Check if the all-in constitutes a raise
                  # Check if it's a valid raise (at least min_raise OR putting player all-in)
                  raise_delta = total_player_bet - max_bet_on_table
-                 if raise_delta >= self.min_raise or (player_stack - bet_amount == 0):
+                 # Allow raise if delta >= min_raise OR if the player is now all-in (stack == 0)
+                 if raise_delta >= self.min_raise or self.stacks.get(player_id, 0) == 0:
                       is_raise = True
                       self.last_raiser = player_id
                       self.min_raise = max(self.min_raise, raise_delta) # Update min raise for next player
@@ -609,25 +552,25 @@ class BaseFullPokerEnv(gym.Env):
             is_bb = False # Determine if current player is BB
             active_list_sorted = sorted(list(self.active_players_in_round))
             num_active_in_round = len(active_list_sorted)
+            if num_active_in_round < 2: return True # Should not happen here, but safety
+
             button_idx_in_active = -1
             try: button_idx_in_active = active_list_sorted.index(self.button_pos)
             except ValueError: button_idx_in_active = 0 # Default if button not active
 
-            if num_active_in_round > 1:
-                 bb_player_idx = -1
-                 if num_active_in_round == 2:
-                      bb_player_idx = (button_idx_in_active + 1) % num_active_in_round
-                 else:
-                      bb_player_idx = (button_idx_in_active + 2) % num_active_in_round
+            bb_player = -1
+            if num_active_in_round == 2:
+                 bb_player = active_list_sorted[(button_idx_in_active + 1) % num_active_in_round]
+            else: # 3+ players
+                 bb_player = active_list_sorted[(button_idx_in_active + 2) % num_active_in_round]
 
-                 if bb_player_idx != -1 and bb_player_idx < len(active_list_sorted):
-                      bb_player = active_list_sorted[bb_player_idx]
-                      # Check if action is on BB, they were the last raiser (blind), and bet is BB amount
-                      if self.current_player_id == bb_player and \
-                         self.last_raiser == bb_player and \
-                         max_bet == self.big_blind:
-                           # print("Debug: Betting continues - Preflop action on BB to check/raise.") # Debug
-                           return False # BB still needs to act
+            # Check if action is on BB, they were the last raiser (blind), and bet is BB amount
+            if self.stage == 'preflop' and \
+               self.current_player_id == bb_player and \
+               self.last_raiser == bb_player and \
+               max_bet == self.big_blind:
+                   # print("Debug: Betting continues - Preflop action on BB to check/raise.") # Debug
+                   return False # BB still needs to act
 
             # print("Debug: Betting round over - all active players acted and matched.") # Debug
             return True
@@ -636,7 +579,7 @@ class BaseFullPokerEnv(gym.Env):
 
 
     def _get_winners(self):
-        """ Determines the winner(s) at showdown. """
+        """ Determines the winner(s) at showdown using the imported evaluator. """
         active_showdown = list(self.active_players_in_round) # Players involved in showdown
         if not active_showdown: return [], {} # No active players
 
@@ -660,16 +603,21 @@ class BaseFullPokerEnv(gym.Env):
                  # print(f"Player {player_id} has no hand for showdown?") # Debug
                  continue # Skip players with no hand
 
-            # Use the (placeholder) hand evaluator
-            score, desc = evaluate_hand(hole, self.community_cards)
-            showdown_hands[player_id] = {'hand': hole, 'score': score, 'desc': desc}
-            # print(f"Player {player_id} Showdown: Hand={hole} -> Score={score} ({desc})") # Debug
+            # Use the imported improved hand evaluator
+            try:
+                 score, desc = evaluate_hand_improved(hole, self.community_cards)
+                 showdown_hands[player_id] = {'hand': hole, 'score': score, 'desc': desc}
+                 # print(f"Player {player_id} Showdown: Hand={hole} -> Score={score} ({desc})") # Debug
 
-            if score > best_score:
-                best_score = score
-                winners = [player_id]
-            elif score == best_score:
-                winners.append(player_id)
+                 if score > best_score:
+                     best_score = score
+                     winners = [player_id]
+                 elif score == best_score:
+                     winners.append(player_id)
+            except Exception as e:
+                 print(f"Error evaluating hand for player {player_id} ({hole} + {self.community_cards}): {e}")
+                 showdown_hands[player_id] = {'hand': hole, 'score': -1, 'desc': "Eval Error"}
+
 
         # print(f"Best Score: {best_score}, Winners: {winners}") # Debug
         return winners, showdown_hands
@@ -716,14 +664,14 @@ class BaseFullPokerEnv(gym.Env):
              if self.tournament_over:
                   obs = self._get_obs(self.agent_id)
                   # Return 0 reward as this step didn't involve agent action leading to end
-                  return obs, 0.0, True, False, self._get_info(round_over=True)
+                  return obs, 0.0, True, False, self._get_info(round_over=True, terminated=True)
              # If new round started, proceed to get the current player and potentially act
 
         if self.tournament_over:
             # Return terminal observation consistent with Gym API
             obs = self._get_obs(self.agent_id)
             # Reward should be 0 if already terminated
-            return obs, 0.0, True, False, self._get_info(round_over=self.round_over)
+            return obs, 0.0, True, False, self._get_info(round_over=self.round_over, terminated=True)
 
 
         # --- Main Step Logic ---
@@ -737,7 +685,7 @@ class BaseFullPokerEnv(gym.Env):
                  print("Error Recovery Failed: No active player found. Ending tournament.")
                  self.tournament_over = True
                  obs = self._get_obs(self.agent_id)
-                 return obs, 0.0, True, False, self._get_info(error="current_player_id was None/Empty")
+                 return obs, 0.0, True, False, self._get_info(error="current_player_id was None/Empty", terminated=True)
 
 
         is_agent_turn = (player_id == self.agent_id)
@@ -755,7 +703,7 @@ class BaseFullPokerEnv(gym.Env):
             if player_id is None or self.seat_config.get(player_id) == 'empty':
                  # If turn lands on empty seat or becomes None, find next valid player
                  # print(f"Debug: Skipping turn for invalid/empty player {player_id}") # Debug
-                 next_player = self._get_next_active_player_id(player_id if player_id is not None else self.button_pos)
+                 next_player = self._get_next_active_player_id(player_id) # Pass current player_id (even if None)
                  if next_player == self.current_player_id and next_player is not None: # Avoid infinite loop if stuck
                       print(f"Error: Stuck finding next player from {player_id}. Ending round.")
                       self.round_over = True
@@ -880,8 +828,8 @@ class BaseFullPokerEnv(gym.Env):
                 winner_declared = False
                 if active_players_final:
                      final_winner_id = active_players_final[0]
-                     if final_winner_id == self.agent_id: print(f"Tournament Over: Agent {self.agent_id} wins!")
-                     else: print(f"Tournament Over: Player {final_winner_id} wins!")
+                     if final_winner_id == self.agent_id: print(f"Tournament Over: Agent {self.agent_id+1} wins!")
+                     else: print(f"Tournament Over: Player {final_winner_id+1} wins!")
                      winner_declared = True
                 if not winner_declared: print(f"Tournament Over: No single winner.")
                 self.tournament_over = True
@@ -945,6 +893,7 @@ class BaseFullPokerEnv(gym.Env):
 
         # Ensure round_over flag in final_info is accurate
         final_info['round_over'] = round_ended_this_step
+        final_info['terminated'] = terminated # Pass terminated status
 
         return obs, step_reward, terminated, truncated, final_info
 
@@ -994,7 +943,7 @@ class BaseFullPokerEnv(gym.Env):
             encoded_state = encode_obs(obs_dict) # Pass the dictionary
 
         except ImportError:
-            print("ERROR: Could not import encode_obs from utils. Update utils.py!")
+            print("ERROR: Could not import encode_obs from .utils. Update utils.py!")
         except Exception as e:
             print(f"ERROR during observation encoding: {e}. Check utils.encode_obs!")
             print(f"Observation dict causing error: {obs_dict}") # Print dict for debugging
@@ -1026,7 +975,8 @@ class BaseFullPokerEnv(gym.Env):
             "active_players": list(self.active_players_in_round),
             # Ensure round_over defaults to False if not explicitly set
             "round_over": self.round_over, # Use current state flag
-            "current_player_id": self.current_player_id # Include current player ID
+            "current_player_id": self.current_player_id, # Include current player ID
+            "terminated": self.tournament_over # Include termination status
         }
         info.update(extra_info) # Add specific info like round_over=True, round_reward
         return info
@@ -1050,17 +1000,17 @@ class BaseFullPokerEnv(gym.Env):
                  continue
 
             # Try to import render_card for better display if available
-            try: from Front_End.card_utils import render_card
-            except ImportError: render_card = lambda x: x # Fallback
+            try: from Front_End.card_utils import render_hand # Use render_hand for simpler text output
+            except ImportError: render_hand = lambda x: " ".join(x) # Fallback
 
-            hand_str = " ".join(render_card(c) for c in self.hands.get(i, []))
+            hand_str = render_hand(self.hands.get(i, []))
             if not hand_str and i in self.active_players_in_round: hand_str = "? ?" # Show placeholders only if active
             elif not hand_str: hand_str = "" # Don't show placeholders if folded/out
 
-            stack_str = f"{self.stacks.get(i, 0):.2f}"
-            bet_str = f"{self.current_bets.get(i, 0):.2f}"
+            stack_str = f"{self.stacks.get(i, 0):.0f}" # No decimals for stack
+            bet_str = f"{self.current_bets.get(i, 0):.0f}" # No decimals for bet
             status = ""
-            if i not in self.active_players_in_round and i in self.hands: status = " (Folded)"
+            if i not in self.active_players_in_round and i in self.hands and self.stacks.get(i,0) > 0: status = " (Folded)"
             elif self.stacks.get(i,0) <= 0 and i in self.active_players_in_round: status = " (All-In)"
             elif self.stacks.get(i,0) <= 0: status = " (Out)" # Use stack check for Out status
 
@@ -1123,4 +1073,36 @@ class TrainFullPokerEnv(BaseFullPokerEnv):
 
      def get_current_bets(self):
           return self.current_bets.copy()
+
+
+# Example of how to run tests if the file is executed directly
+if __name__ == "__main__":
+    print("Running envs.py directly for testing...")
+
+    # Example: Test hand evaluation import
+    try:
+        test_score, test_desc = evaluate_hand_improved(["AS", "KS", "QS", "JS", "TS"], [])
+        print(f"Test Eval (Royal Flush): {test_desc} (Score: {test_score})")
+        test_score_2, test_desc_2 = evaluate_hand_improved(["7H", "7D", "7C", "2S", "KH"], [])
+        print(f"Test Eval (Three 7s): {test_desc_2} (Score: {test_score_2})")
+    except Exception as e:
+        print(f"Error during hand evaluation test: {e}")
+
+    # Example: Instantiate and reset the environment
+    try:
+        print("\nInstantiating environment...")
+        test_env = BaseFullPokerEnv()
+        print("Resetting environment...")
+        obs, info = test_env.reset()
+        print("Reset successful. Initial Info:")
+        # Pretty print the info dictionary
+        import json
+        print(json.dumps(info, indent=2, default=str))
+        print("\nRendering initial state:")
+        test_env.render()
+        test_env.close()
+    except Exception as e:
+        print(f"\nError during environment instantiation/reset test: {e}")
+        import traceback
+        traceback.print_exc()
 
