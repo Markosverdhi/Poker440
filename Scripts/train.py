@@ -1,25 +1,8 @@
-# filename: package/train.py
-"""
-train.py
-
-This script trains the Poker RL Agent using the BestPokerModel architecture
-and the Gymnasium-compliant TrainFullPokerEnv (modified for tournament play).
-
-MODIFIED (Tournament Episodes - Prompts 1 & 2):
-- Adapted for tournament-based episodes and per-round rewards in replay buffer.
-
-MODIFIED (Fix Model Instantiation TypeError):
-- Removed the unexpected 'input_dim' keyword argument when instantiating
-  BestPokerModel, consistent with the updated models.py.
-
-MODIFIED (Fix Tensor dtype TypeError):
-- Changed dtype=np.float32 to dtype=torch.float32 when creating dones_tensor.
-"""
-
 import os
 import random
 import csv
 import argparse
+import time # Import time at the top
 from collections import deque, defaultdict
 
 import numpy as np
@@ -27,328 +10,669 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-# Import Gymnasium-compliant environment and updated utils
+# Assume these imports work correctly and point to your environment and model files
 try:
-    # Use the Gym-compliant version of the environment (MUST be updated for tournament logic)
+    # Ensure relative imports work if train.py is outside Back_End
+    # If train.py is inside Back_End, use: from .envs import TrainFullPokerEnv etc.
     from Back_End.envs import TrainFullPokerEnv
-    # Use updated utils with new encoding and state dim
-    from Back_End.utils import encode_obs, epsilon_by_frame, ReplayBuffer, NEW_STATE_DIM
-except ImportError:
-    print("ERROR: Ensure envs.py and utils.py (with NEW_STATE_DIM) are available.")
-    exit()
-
-# Assuming models.py is available and updated for NEW_STATE_DIM
-try:
+    from Back_End.utils import encode_obs, epsilon_by_frame, ReplayBuffer # Assuming NEW_STATE_DIM is handled by encode_obs
     from Back_End.models import BestPokerModel
-except ImportError:
-    print("ERROR: Ensure models.py is available.")
+except ImportError as e:
+    print(f"ERROR: Could not import required modules: {e}")
+    print("Ensure envs.py, utils.py, and models.py are accessible from your current directory.")
+    print("If train.py is not in the parent directory of Back_End, adjust the import paths.")
     exit()
 
 
-# --- Global configuration ---
-USE_HALF_ENCODING = False # Keep False for new encoding
+# --- Constants ---
+# NUM_PLAYERS should ideally match the environment's default or be configurable
 NUM_PLAYERS = 6
-# Use state dim defined in utils.py
-STATE_DIM = NEW_STATE_DIM
-# Action list/count will be derived from env instance
+
 
 class Train:
-    def __init__(self, episodes, random_range, variable_mode, resume_from=None):
-        self.num_episodes = episodes # Number of tournaments to run
-        self.random_range = self._parse_range(random_range) if random_range else None
-        self.variable_mode = variable_mode
+    def __init__(self, episodes, resume_from=None):
+        self.num_episodes = episodes
         self.resume_from = resume_from
         self.checkpoint_dir = "checkpoints"
         if not os.path.exists(self.checkpoint_dir):
             os.makedirs(self.checkpoint_dir)
-        self.current_update_index = 0
+        self.current_update_index = 0 # For rotating opponent models
 
-        # Training hyperparameters (adjust if needed for tournaments)
+        # --- Hyperparameters (can be overridden by args) ---
         self.buffer_capacity = 10000
         self.batch_size = 64
         self.learning_rate = 1e-4
         self.gamma = 0.99 # Discount factor
-        self.target_update_freq = 500 # Update target less frequently? (Adjust based on steps/tournament)
-        self.opponent_update_freq = 500 # Tournaments between opponent updates
-        self.checkpoint_save_freq = 200 # Tournaments between checkpoints
-        self.metrics_save_freq = 10 # Tournaments between metric saves
+        self.target_update_freq = 50 # Steps between updating target network
+        self.opponent_update_freq = 15 # Episodes between updating one opponent model
+        self.checkpoint_save_freq = 200 # Episodes between saving checkpoints
+        self.metrics_save_freq = 10 # Episodes between saving metrics
+        self.max_steps_per_tournament = 500 # Safety break for episodes
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
-        # Environment instance needed later
-        self.env = None
+        self.env = None # Initialized in run()
 
-    def _parse_range(self, range_str):
-        # (Unchanged)
-        try:
-            parts = range_str.split('-')
-            if len(parts) == 2: return (int(parts[0]), int(parts[1]))
-            else: raise ValueError("Range must have start and end separated by '-'.")
-        except Exception as e: raise ValueError(f"Invalid range format '{range_str}'. Use 'start-end'. Error: {e}")
-
-    def _in_range(self, episode, range_tuple):
-        # (Unchanged)
-        return range_tuple and range_tuple[0] <= episode <= range_tuple[1]
-
-    # --- Opponent Policy Creation (Unchanged) ---
     def make_opponent_policy(self, opponent_model, action_list):
+        """Creates a policy function for an opponent using a trained model."""
         num_actions = len(action_list)
+        string_to_action_map = {s: i for i, s in enumerate(action_list)}
+
         def policy_fn(obs_dict):
-            if not isinstance(obs_dict, dict): return 'fold'
+            # Basic validation of observation
+            if not isinstance(obs_dict, dict):
+                return 'fold'
+
             legal_actions = obs_dict.get('legal_actions', [])
-            if not legal_actions: return 'fold'
-            try: state = encode_obs(obs_dict) # Use training encoder
-            except Exception as e: print(f"Error encoding opponent obs: {e}. Folding."); return 'fold'
+            if not legal_actions:
+                return 'fold' # Should ideally not happen if game logic is correct
+
+            # Attempt to encode observation
+            try:
+                # Ensure encode_obs handles the opponent's observation format correctly
+                state = encode_obs(obs_dict) # Relies on utils.encode_obs
+            except Exception as e:
+                print(f"Error encoding opponent obs: {e}. Folding.")
+                return 'fold'
+
             state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-            opponent_model.eval()
-            with torch.no_grad(): q_values = opponent_model(state_tensor)
-            q_values_np = q_values.squeeze().cpu().numpy(); sorted_indices = np.argsort(q_values_np)[::-1]
+
+            # Get Q-values from the opponent model
+            opponent_model.eval() # Ensure model is in evaluation mode
+            with torch.no_grad():
+                q_values = opponent_model(state_tensor)
+
+            q_values_np = q_values.squeeze().cpu().numpy()
+            sorted_indices = np.argsort(q_values_np)[::-1] # Best actions first
+
+            # Choose the best action that is legal
             for action_idx in sorted_indices:
                 if 0 <= action_idx < num_actions:
                     action_str = action_list[action_idx]
-                    if action_str in legal_actions: return action_str
+                    if action_str in legal_actions:
+                        return action_str # Return the best valid action
+
+            # Fallback if no predicted action is legal
             if 'check' in legal_actions: return 'check'
             if 'call' in legal_actions: return 'call'
             if 'fold' in legal_actions: return 'fold'
-            return random.choice(legal_actions) if legal_actions else 'fold'
+
+            # Absolute fallback: choose randomly from legal actions
+            return random.choice(legal_actions)
+
         return policy_fn
 
-    # --- Random Policy (Unchanged) ---
     def random_policy(self, obs_dict):
+        """A simple policy that chooses a random legal action, prioritizing safe actions."""
         if not isinstance(obs_dict, dict): return 'fold'
         legal = obs_dict.get('legal_actions', [])
         if not legal: return 'fold'
+        # Prioritize check/call/fold over random raise/bet if available
+        if 'check' in legal: return 'check'
+        if 'call' in legal: return 'call'
+        if 'fold' in legal: return 'fold'
         return random.choice(legal)
 
-    # --- Opponent Update Logic ---
     def update_opponent_policy(self, opponent_id, policy_type, env, agent_action_list):
+        """Sets the policy for a specific opponent based on latest checkpoint or random."""
         num_actions = len(agent_action_list)
         if policy_type == "model":
             checkpoint_files = [f for f in os.listdir(self.checkpoint_dir) if f.startswith('checkpoint_') and f.endswith('.pt')]
             if not checkpoint_files:
                 print(f"Warning: No checkpoints found for opponent {opponent_id}. Using random policy.")
-                env.set_opponent_policy(opponent_id, self.random_policy); return
+                env.set_opponent_policy(opponent_id, self.random_policy)
+                return
+
             try:
+                # Sort by episode number (integer part of the filename)
                 checkpoint_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]), reverse=True)
-                latest_checkpoint_name = checkpoint_files[0]
+                latest_checkpoint_name = checkpoint_files[0] # Use the most recent one
             except (ValueError, IndexError):
-                print("Warning: Could not sort checkpoints by number. Using alphabetically last."); checkpoint_files.sort(reverse=True)
-                if not checkpoint_files: print(f"Error: No checkpoint files found after sort for opponent {opponent_id}. Using random."); env.set_opponent_policy(opponent_id, self.random_policy); return
+                # Fallback if parsing filename fails
+                print("Warning: Could not sort checkpoints by number. Using alphabetically last.")
+                checkpoint_files.sort(reverse=True)
+                if not checkpoint_files:
+                     print(f"Error: No checkpoint files found after sort for opponent {opponent_id}. Using random.")
+                     env.set_opponent_policy(opponent_id, self.random_policy)
+                     return
                 latest_checkpoint_name = checkpoint_files[0]
+
             full_checkpoint_path = os.path.join(self.checkpoint_dir, latest_checkpoint_name)
+            # print(f"Attempting to load opponent {opponent_id} policy from: {latest_checkpoint_name}") # Less verbose
             try:
                 checkpoint = torch.load(full_checkpoint_path, map_location=self.device)
-                if isinstance(checkpoint, dict): opp_state_dict = checkpoint.get('agent_state_dict', checkpoint)
-                else: opp_state_dict = checkpoint
-                if not isinstance(opp_state_dict, dict): raise TypeError("Loaded checkpoint state is not a dict.")
+
+                # Handle both dictionary and raw state_dict checkpoints
+                if isinstance(checkpoint, dict):
+                    opp_state_dict = checkpoint.get('agent_state_dict', checkpoint) # Prefer 'agent_state_dict' if available
+                else:
+                    opp_state_dict = checkpoint # Assume it's just the state_dict
+
+                if not isinstance(opp_state_dict, dict):
+                    raise TypeError(f"Loaded checkpoint state for opponent {opponent_id} is not a dictionary.")
+
+                # Remove 'module.' prefix if saved with DataParallel
                 cleaned_state_dict = {k.replace('module.', ''): v for k, v in opp_state_dict.items()}
 
-                # ** FIXED: Instantiate model without input_dim **
+                # Create and load the opponent model
                 opponent_model = BestPokerModel(num_actions=num_actions).to(self.device)
-                opponent_model.load_state_dict(cleaned_state_dict, strict=False); opponent_model.eval()
+                # Use strict=False initially to handle potential architecture mismatches during development
+                load_info = opponent_model.load_state_dict(cleaned_state_dict, strict=False)
+                if load_info.missing_keys or load_info.unexpected_keys:
+                    print(f"Warning loading opponent {opponent_id}: Missing={load_info.missing_keys}, Unexpected={load_info.unexpected_keys}")
 
+                opponent_model.eval() # Set to evaluation mode
+
+                # Create and set the policy function
                 policy_fn = self.make_opponent_policy(opponent_model, agent_action_list)
                 env.set_opponent_policy(opponent_id, policy_fn)
+                # print(f"Successfully loaded model policy for opponent {opponent_id} from {latest_checkpoint_name}") # Less verbose
+
             except Exception as e:
-                print(f"Error loading checkpoint {latest_checkpoint_name} for opponent {opponent_id}: {e}. Using random policy.")
+                print(f"ERROR loading checkpoint {latest_checkpoint_name} for opponent {opponent_id}: {e}. Using random policy.")
                 env.set_opponent_policy(opponent_id, self.random_policy)
+
         elif policy_type == "random":
+            # print(f"Setting opponent {opponent_id} to random policy.") # Less verbose
             env.set_opponent_policy(opponent_id, self.random_policy)
         else:
-            print(f"Warning: Unknown policy type '{policy_type}'. Using random.")
+            print(f"Warning: Unknown policy type '{policy_type}' for opponent {opponent_id}. Using random.")
             env.set_opponent_policy(opponent_id, self.random_policy)
+
+    def update_one_opponent_from_checkpoint(self, opponent_id, checkpoint_path, action_list):
+        """Loads a specific checkpoint for a single opponent."""
+        print(f"Updating opponent {opponent_id} policy from specific checkpoint: {os.path.basename(checkpoint_path)}")
+        num_actions = len(action_list)
+        try:
+            ck = torch.load(checkpoint_path, map_location=self.device)
+            state_dict = ck.get('agent_state_dict', ck) if isinstance(ck, dict) else ck
+            if not isinstance(state_dict, dict):
+                 raise TypeError("Loaded checkpoint state is not a dict.")
+
+            cleaned = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+            model = BestPokerModel(num_actions=num_actions).to(self.device)
+            load_info = model.load_state_dict(cleaned, strict=False) # Use strict=False for flexibility
+            if load_info.missing_keys or load_info.unexpected_keys:
+                 print(f"  Load info for opponent {opponent_id}: {load_info}")
+            model.eval()
+
+            policy_fn = self.make_opponent_policy(model, action_list)
+            self.env.set_opponent_policy(opponent_id, policy_fn)
+            print(f"  Successfully updated opponent {opponent_id}.")
+        except Exception as e:
+            print(f"  ERROR loading specific checkpoint {os.path.basename(checkpoint_path)} for opponent {opponent_id}: {e}. Keeping previous policy.")
+            # Optionally set to random here, or just let it keep its current policy
+            # self.env.set_opponent_policy(opponent_id, self.random_policy)
 
 
     def run(self):
-        # --- Environment and Agent Setup ---
+        """Main training loop."""
         try:
+            # Initialize environment - ensure agent_id=0 is correct
+            # Pass seat_config if you want specific opponent types, otherwise defaults to 'model'
             self.env = TrainFullPokerEnv(num_players=NUM_PLAYERS, agent_id=0)
-        except Exception as e: print(f"FATAL: Failed to initialize environment: {e}"); return
+            print("Poker environment initialized.")
+        except Exception as e:
+            print(f"FATAL: Failed to initialize environment: {e}")
+            return # Cannot proceed without environment
 
-        agent_action_list = self.env.action_list
-        num_actions = self.env.action_space.n
+        # Get action space details from the environment
+        agent_action_list = self.env.action_list # List of action strings
+        num_actions = self.env.action_space.n # Number of actions
         action_to_string = {i: s for i, s in enumerate(agent_action_list)}
         string_to_action = {s: i for i, s in enumerate(agent_action_list)}
+        print(f"Agent Action Space ({num_actions} actions): {agent_action_list}")
 
-        # ** FIXED: Instantiate models without input_dim **
+        # Initialize Agent and Target Network
         agent = BestPokerModel(num_actions=num_actions).to(self.device)
         target_net = BestPokerModel(num_actions=num_actions).to(self.device)
+        print("Agent and Target networks initialized.")
+
+        # Initialize Optimizer and Replay Buffer
         optimizer = optim.Adam(agent.parameters(), lr=self.learning_rate)
         replay_buffer = ReplayBuffer(capacity=self.buffer_capacity)
+        print(f"Optimizer (Adam, lr={self.learning_rate}) and Replay Buffer (cap={self.buffer_capacity}) initialized.")
 
-        start_episode = 1; global_step = 0; last_checkpoint_episode = 0
-        episode_rewards = []; metrics_list = []
+        # --- State Initialization ---
+        start_episode = 1
+        global_step = 0
+        episode_rewards_deque = deque(maxlen=100) # Store last 100 episode rewards for avg calculation
+        metrics_list = [] # Temporary storage for metrics before saving
+        loss_history = deque(maxlen=100) # Track recent losses
 
-        # --- Resume from checkpoint ---
+        # --- Resume Logic ---
         resumed_successfully = False
         if self.resume_from and os.path.exists(self.resume_from):
-             print(f"Attempting to resume training from checkpoint: {self.resume_from}")
-             try:
-                 checkpoint = torch.load(self.resume_from, map_location=self.device)
-                 if not isinstance(checkpoint, dict): raise TypeError("Checkpoint file is not a dictionary.")
-                 if 'agent_state_dict' in checkpoint: agent.load_state_dict(checkpoint['agent_state_dict'], strict=False)
-                 if 'target_net_state_dict' in checkpoint: target_net.load_state_dict(checkpoint['target_net_state_dict'], strict=False)
-                 else: target_net.load_state_dict(agent.state_dict())
-                 if 'optimizer_state_dict' in checkpoint: optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                 start_episode = checkpoint.get('episode', start_episode -1) + 1
-                 global_step = checkpoint.get('global_step', global_step)
-                 last_checkpoint_episode = checkpoint.get('episode', 0)
-                 print(f"Successfully resumed from Tournament {start_episode}, Global Step {global_step}")
-                 resumed_successfully = True
-             except Exception as e:
-                 print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-                 print(f"!!! FAILED TO LOAD CHECKPOINT: {self.resume_from} !!! Error: {e}")
-                 print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-                 start_episode = 1; global_step = 0; last_checkpoint_episode = 0
-                 # ** FIXED: Instantiate models without input_dim **
-                 agent = BestPokerModel(num_actions=num_actions).to(self.device)
-                 target_net = BestPokerModel(num_actions=num_actions).to(self.device)
-                 optimizer = optim.Adam(agent.parameters(), lr=self.learning_rate)
-                 replay_buffer = ReplayBuffer(capacity=self.buffer_capacity)
-                 resumed_successfully = False
+            print(f"Attempting to resume training from checkpoint: {self.resume_from}")
+            try:
+                checkpoint = torch.load(self.resume_from, map_location=self.device)
+                if not isinstance(checkpoint, dict):
+                    raise TypeError("Checkpoint file is not a dictionary.")
+
+                # Load Agent state
+                if 'agent_state_dict' in checkpoint:
+                    load_info_agent = agent.load_state_dict(checkpoint['agent_state_dict'], strict=True) # Be strict on resume
+                    print(f"  Agent load info: {load_info_agent}")
+                else:
+                     print("Warning: 'agent_state_dict' not found in checkpoint.")
+
+                # Load Target Net state (or copy from agent if missing)
+                if 'target_net_state_dict' in checkpoint:
+                    load_info_target = target_net.load_state_dict(checkpoint['target_net_state_dict'], strict=True)
+                    print(f"  Target Net load info: {load_info_target}")
+                else:
+                    print("Warning: 'target_net_state_dict' not found. Copying from loaded agent state.")
+                    target_net.load_state_dict(agent.state_dict()) # Initialize target from agent
+
+                # Load Optimizer state
+                if 'optimizer_state_dict' in checkpoint:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    print("  Optimizer state loaded.")
+                     # Ensure optimizer state is moved to the correct device if necessary
+                    for state in optimizer.state.values():
+                        for k, v in state.items():
+                            if isinstance(v, torch.Tensor):
+                                state[k] = v.to(self.device)
+                else:
+                     print("Warning: 'optimizer_state_dict' not found in checkpoint.")
+
+                # Load training progress
+                start_episode = checkpoint.get('episode', start_episode - 1) + 1 # Resume from next episode
+                global_step = checkpoint.get('global_step', global_step)
+                # Load opponent update index if saved
+                self.current_update_index = checkpoint.get('current_update_index', self.current_update_index)
+
+                print(f"Successfully resumed from Tournament {start_episode}, Global Step {global_step}")
+                resumed_successfully = True
+
+            except Exception as e:
+                print(f"!!! FAILED TO LOAD CHECKPOINT: {e} !!!")
+                print("Starting from scratch.")
+                start_episode = 1
+                global_step = 0
+                # Ensure target net is initialized from agent if resume fails
+                target_net.load_state_dict(agent.state_dict())
+
         if not resumed_successfully:
+            # Initialize target network from agent if not resuming or if resume failed
             target_net.load_state_dict(agent.state_dict())
-            print("Starting training from scratch (or after checkpoint load failure).")
+            print("Starting training from scratch (or after checkpoint load failure). Target network initialized.")
 
-        # Initialize opponent policies
-        print("Initializing opponent policies...")
-        opponent_ids = list(range(1, NUM_PLAYERS))
+        # --- Initialize Opponent Policies ---
+        opponent_ids = list(range(1, NUM_PLAYERS)) # IDs 1 to NUM_PLAYERS-1
+        print(f"Initializing policies for opponents: {opponent_ids}")
         for opp_id in opponent_ids:
-             self.update_opponent_policy(opp_id, "model", self.env, agent_action_list)
+            # Initialize opponents with the latest available checkpoint model or random
+            self.update_opponent_policy(opp_id, "model", self.env, agent_action_list)
 
-        # --- Training Loop ---
-        print(f"\n--- Starting Training Loop (Max Tournaments: {self.num_episodes}) ---")
+        print(f"\n--- Starting Training Loop (Episode {start_episode} to {self.num_episodes}) ---")
+
+        # --- Main Training Loop ---
         for episode in range(start_episode, self.num_episodes + 1):
-            try: state, info = self.env.reset()
-            except Exception as e: print(f"FATAL: Error during env.reset() for T {episode}: {e}"); break
-            if info.get("error"): print(f"Error starting T {episode}: {info['error']}"); continue
+            episode_start_time = time.time()
+            episode_reward_cumulative = 0.0 # Track cumulative reward *within* this episode
 
-            done = False; tournament_reward = 0; tournament_agent_steps = 0
+            try:
+                # Reset environment for a new tournament (episode)
+                state, info = self.env.reset()
+                if not isinstance(state, np.ndarray):
+                     print(f"Warning: env.reset() did not return a numpy array state for episode {episode}. Type: {type(state)}. Attempting to continue.")
 
-            # Inner loop: Runs for one tournament
-            while not done:
-                # --- Determine Action ---
-                action_idx = -1; agent_took_action = False
-                try: current_player = self.env.current_player_id; agent_id = self.env.agent_id
-                except AttributeError as e: print(f"FATAL: Env missing attribute: {e}. Stopping T."); done = True; break
+            except Exception as e:
+                print(f"ERROR: Failed env.reset() for Tournament {episode}: {e}. Skipping tournament.")
+                time.sleep(1) # Add a small delay if resets fail often
+                continue # Skip to the next episode
 
-                if current_player == agent_id:
-                    try: legal_actions_list = self.env.get_legal_actions_for_agent()
-                    except Exception as e: print(f"Error getting legal actions: {e}"); legal_actions_list = ['fold']
-                    if not legal_actions_list: action_idx = -1
-                    else:
-                        agent_took_action = True; epsilon = epsilon_by_frame(global_step)
-                        if random.random() < epsilon:
-                            action_str = random.choice(legal_actions_list); action_idx = string_to_action.get(action_str)
-                            if action_idx is None: print(f"Warning: Random action '{action_str}' not mapped."); action_idx = 0
-                        else:
-                            state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-                            agent.eval();
-                            with torch.no_grad(): q_values = agent(state_tensor)
-                            agent.train(); q_values_np = q_values.squeeze().cpu().numpy(); sorted_indices = np.argsort(q_values_np)[::-1]
-                            action_idx = -1
-                            for idx in sorted_indices:
-                                potential_action_str = action_to_string.get(idx)
-                                if potential_action_str is not None and potential_action_str in legal_actions_list: action_idx = idx; break
-                            if action_idx == -1:
-                                 action_str = random.choice(legal_actions_list); action_idx = string_to_action.get(action_str)
-                                 if action_idx is None: print(f"Warning: Fallback action '{action_str}' not mapped."); action_idx = 0
-                else: action_idx = -1
+            # Check for errors reported by the environment during reset
+            if info and info.get("error"):
+                print(f"Error reported by env.reset() for Tournament {episode}: {info['error']}. Skipping tournament.")
+                continue
 
-                # --- Environment Step ---
-                next_state, step_reward, terminated, truncated, info = None, 0.0, False, False, {}
+            terminated = False
+            truncated = False # Gym standard flags
+            tournament_agent_steps = 0
+            tournament_total_steps = 0 # Includes opponent steps processed by env
+
+            # --- Inner Loop (Steps within a tournament/episode) ---
+            # Continues until the tournament (episode) is terminated or truncated
+            while not terminated and not truncated:
+                # Safety break for excessively long tournaments
+                if tournament_total_steps >= self.max_steps_per_tournament:
+                    print(f"WARNING: Tournament {episode} exceeded max steps ({self.max_steps_per_tournament}). Truncating episode.")
+                    truncated = True # Use truncated flag
+                    # Apply penalty if desired for truncation
+                    # episode_reward_cumulative -= 1000
+                    break # Exit the inner while loop
+
+                # Determine whose turn it is (assuming env updates this)
+                current_player = self.env.current_player_id
+
                 try:
-                    next_state, step_reward, terminated, truncated, info = self.env.step(action_idx)
-                    step_done = terminated or truncated
-                except ValueError as e:
-                    if "Cannot step in a round that is already over" in str(e): print(f"ERROR CAUGHT in T {episode}: {e}. Forcing T end."); done = True; continue
-                    else: print(f"Unexpected ValueError during env.step() in T {episode}: {e}"); raise e
-                except Exception as e: print(f"Unexpected Error during env.step() in T {episode}: {type(e).__name__}: {e}"); done = True; continue
+                    # --- Agent's Turn ---
+                    if current_player == self.env.agent_id:
+                        # Ensure state is valid
+                        if not isinstance(state, np.ndarray):
+                             print(f"ERROR: Agent's turn in T {episode}, Step {tournament_total_steps}, but state is not a numpy array ({type(state)}). Terminating episode.")
+                             terminated = True # Terminate on critical error
+                             break
 
-                # --- Store Experience & Learn ---
-                if agent_took_action:
-                    if state is not None and next_state is not None and action_idx != -1:
-                        is_round_over = info.get('round_over', False)
-                        reward_to_store = info.get('round_reward', 0.0) if is_round_over else 0.0
-                        replay_buffer.push(state, action_idx, reward_to_store, next_state, float(step_done))
-                        tournament_agent_steps += 1; global_step += 1
+                        # Get legal actions for the agent
+                        legal = self.env.get_legal_actions_for_agent()
+                        if not legal:
+                            # This might happen if agent is already all-in but somehow gets turn
+                            print(f"Warning: Agent {self.env.agent_id} has no legal actions in T {episode}, Step {tournament_total_steps}. Env issue? Forcing check/fold.")
+                            # Attempt to find a safe default, or terminate if state seems invalid
+                            if 'check' in self.env._get_legal_actions(current_player): # Check internal state if needed
+                                action_idx = string_to_action.get('check', 0)
+                            else:
+                                action_idx = string_to_action.get('fold', 0)
+
+                        else:
+                            # Epsilon-Greedy Action Selection
+                            epsilon = epsilon_by_frame(global_step) # Get current exploration rate
+                            if random.random() < epsilon:
+                                # Exploration: Choose a random legal action
+                                action_str = random.choice(legal)
+                                action_idx = string_to_action.get(action_str, 0) # Default to 0 if string not found
+                            else:
+                                # Exploitation: Choose the best legal action based on Q-values
+                                state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+                                agent.eval() # Set model to evaluation mode for inference
+                                with torch.no_grad():
+                                    q_vals = agent(state_tensor).squeeze().cpu().numpy()
+                                agent.train() # Set model back to training mode
+
+                                # Find the best *legal* action index
+                                best_legal_action_idx = -1
+                                best_q_val = -float('inf')
+                                for act_str in legal:
+                                    idx = string_to_action.get(act_str)
+                                    if idx is not None and idx < len(q_vals): # Check index bounds
+                                        if q_vals[idx] > best_q_val:
+                                            best_q_val = q_vals[idx]
+                                            best_legal_action_idx = idx
+                                    else:
+                                        print(f"Warning: Action string '{act_str}' or index {idx} invalid for Q-values.")
+
+
+                                if best_legal_action_idx != -1:
+                                    action_idx = best_legal_action_idx
+                                else:
+                                    # Fallback if something went wrong
+                                    print(f"Warning: Could not find best legal action via Q-values for agent in T {episode}, Step {tournament_total_steps}. Choosing random from {legal}.")
+                                    action_str = random.choice(legal)
+                                    action_idx = string_to_action.get(action_str, 0)
+
+                        # --- Environment Step (Agent) ---
+                        # Execute the chosen action
+                        # Expect env.step to return: next_state, immediate_reward, terminated, truncated, info
+                        next_state, step_reward, terminated, truncated, info = self.env.step(action_idx)
+
+                        # --- Store Experience in Replay Buffer ---
+                        # ** CRITICAL: Using the immediate step_reward returned by env.step **
+                        if isinstance(state, np.ndarray) and isinstance(next_state, np.ndarray):
+                             # The reward stored is the immediate reward from the agent's action
+                             replay_buffer.push(state, action_idx, step_reward, next_state, float(terminated or truncated))
+                        else:
+                             print(f"Warning: Invalid state ({type(state)}) or next_state ({type(next_state)}) type during agent step {tournament_total_steps}. Skipping buffer push.")
+
+                        # Accumulate reward for the episode's total
+                        episode_reward_cumulative += step_reward
+
+                        # --- DQN Learning Update ---
                         if len(replay_buffer) >= self.batch_size:
-                            states_b, actions_b, rewards_b, next_states_b, dones_b = replay_buffer.sample(self.batch_size)
-                            states_tensor = torch.tensor(states_b, dtype=torch.float32, device=self.device); actions_tensor = torch.tensor(actions_b, dtype=torch.long, device=self.device).unsqueeze(1)
-                            rewards_tensor = torch.tensor(rewards_b, dtype=torch.float32, device=self.device).unsqueeze(1); next_states_tensor = torch.tensor(next_states_b, dtype=torch.float32, device=self.device)
-                            # *** FIX: Use torch.float32 for dtype ***
-                            dones_tensor = torch.tensor(dones_b, dtype=torch.float32, device=self.device).unsqueeze(1)
-                            # *** END FIX ***
-                            agent.train(); q_values = agent(states_tensor).gather(1, actions_tensor)
+                            # Sample a batch from the replay buffer
+                            (states_b, actions_b, rewards_b,
+                             next_states_b, dones_b) = replay_buffer.sample(self.batch_size)
+
+                            # Convert batch to tensors
+                            states_t = torch.tensor(states_b, dtype=torch.float32, device=self.device)
+                            actions_t = torch.tensor(actions_b, dtype=torch.long, device=self.device).unsqueeze(1) # Shape: [batch_size, 1]
+                            rewards_t = torch.tensor(rewards_b, dtype=torch.float32, device=self.device).unsqueeze(1) # Shape: [batch_size, 1]
+                            next_states_t = torch.tensor(next_states_b, dtype=torch.float32, device=self.device)
+                            dones_t = torch.tensor(dones_b, dtype=torch.float32, device=self.device).unsqueeze(1) # Shape: [batch_size, 1]
+
+                            # --- Calculate Target Q-values (Double DQN) ---
                             with torch.no_grad():
-                                best_next_actions = agent(next_states_tensor).argmax(dim=1, keepdim=True); target_net.eval(); next_q_values = target_net(next_states_tensor).gather(1, best_next_actions)
-                            target = rewards_tensor + self.gamma * next_q_values * (1 - dones_tensor); loss = nn.MSELoss()(q_values, target)
-                            optimizer.zero_grad(); loss.backward(); optimizer.step()
-                        if global_step % self.target_update_freq == 0: target_net.load_state_dict(agent.state_dict())
+                                # 1. Get the action selected by the *current* agent network for the next states
+                                best_next_actions = agent(next_states_t).argmax(dim=1, keepdim=True) # Shape: [batch_size, 1]
+                                # 2. Get the Q-value of those actions from the *target* network
+                                next_q_values_target = target_net(next_states_t).gather(1, best_next_actions)
+                                # 3. Calculate the TD target
+                                target_q_values = rewards_t + self.gamma * next_q_values_target * (1 - dones_t) # dones_t is 1 if terminal
 
-                # --- Update State ---
-                if next_state is not None: state = next_state
-                else: done = True # End tournament if state becomes invalid
-                if isinstance(step_reward, (int, float)): tournament_reward += step_reward
-                done = step_done # Update tournament done flag
-            # --- End of Tournament Loop ---
+                            # --- Calculate Current Q-values ---
+                            # Get the Q-values for the actions actually taken
+                            current_q_values = agent(states_t).gather(1, actions_t)
 
-            # Log results for the completed tournament
-            episode_rewards.append(tournament_reward); avg_reward = np.mean(episode_rewards[-100:]) if episode_rewards else 0.0; current_epsilon = epsilon_by_frame(global_step)
-            metrics_list.append({'episode': episode, 'reward': tournament_reward, 'avg_reward': avg_reward, 'steps': tournament_agent_steps, 'epsilon': current_epsilon})
-            if episode % 100 == 0 or episode == self.num_episodes: print(f"T: {episode}, AgentSteps: {tournament_agent_steps}, T-Reward: {tournament_reward:.2f}, Avg T-Rew: {avg_reward:.2f}, Eps: {current_epsilon:.4f}, GlobalStep: {global_step}")
+                            # --- Calculate Loss ---
+                            loss = nn.MSELoss()(current_q_values, target_q_values)
+                            loss_history.append(loss.item()) # Track loss
 
+                            # --- Backpropagation ---
+                            optimizer.zero_grad()
+                            loss.backward()
+                            # Optional: Gradient clipping
+                            # torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
+                            optimizer.step()
+
+                            # --- Target Network Update ---
+                            if global_step % self.target_update_freq == 0:
+                                target_net.load_state_dict(agent.state_dict())
+
+                        # --- Update State and Stats for Agent's Step ---
+                        state = next_state # Move to the next state
+                        tournament_agent_steps += 1
+                        global_step += 1 # Increment global step counter *only* after an agent step/update
+
+                    # --- Opponent's Turn ---
+                    else:
+                        # Let the environment handle the opponent's turn.
+                        # Call step with a placeholder action (-1)
+                        # Env should internally use the opponent's policy function.
+                        # Env step MUST return the *next state* for the *agent* (player 0)
+                        # and reward=0 (as no agent action occurred).
+                        next_state_after_opponents, step_reward, terminated, truncated, info = self.env.step(-1)
+
+                        # Update the agent's state variable for its *next* turn
+                        state = next_state_after_opponents
+                        # Accumulate any reward assigned to the agent during opponent turns (should be 0)
+                        episode_reward_cumulative += step_reward
+
+                        # Note: We do not store opponent transitions in the agent's buffer
+                        # Note: We do not increment global_step here, only on agent steps
+
+                    tournament_total_steps += 1 # Increment total steps (agent + opponent processing)
+
+                except Exception as e:
+                    print(f"ERROR during step processing in Tournament {episode}, Total Step {tournament_total_steps}, Current Player {current_player}: {e}")
+                    import traceback
+                    traceback.print_exc() # Print detailed traceback
+                    terminated = True # Terminate the episode on error
+                    break # Exit the inner while loop
+
+            # --- End of Tournament (Episode) ---
+            episode_end_time = time.time()
+            episode_duration = episode_end_time - episode_start_time
+
+            episode_rewards_deque.append(episode_reward_cumulative) # Add final cumulative reward for the episode
+            avg_reward = float(np.mean(episode_rewards_deque)) # Calculate rolling average
+            current_epsilon = epsilon_by_frame(global_step) # Epsilon at the end of episode
+            avg_loss = float(np.mean(loss_history)) if loss_history else 0.0
+
+            metrics_list.append({
+                'episode': episode,
+                'reward': episode_reward_cumulative, # Total reward for the episode
+                'avg_reward': avg_reward,
+                'agent_steps': tournament_agent_steps, # Steps taken by agent
+                'total_steps': tournament_total_steps, # Total steps processed in env
+                'epsilon': current_epsilon,
+                'avg_loss': avg_loss,
+                'duration_sec': episode_duration
+            })
+
+            # --- Logging ---
+            if episode % 10 == 0 or episode == self.num_episodes: # Log every 10 episodes
+                print(f"T: {episode}, AgSteps: {tournament_agent_steps}, TotSteps: {tournament_total_steps}, "
+                      f"Reward: {episode_reward_cumulative:.2f}, Avg(100): {avg_reward:.2f}, "
+                      f"AvgLoss(100): {avg_loss:.4f}, Eps: {current_epsilon:.4f}, "
+                      f"GStep: {global_step}, Dur: {episode_duration:.1f}s")
+
+            # --- Save Checkpoint ---
             if episode % self.checkpoint_save_freq == 0 or episode == self.num_episodes:
                 chk = {
                     'agent_state_dict': agent.state_dict(),
                     'target_net_state_dict': target_net.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'episode': episode,
-                    'global_step': global_step
+                    'global_step': global_step,
+                    'current_update_index': self.current_update_index # Save opponent update index
                 }
                 path = os.path.join(self.checkpoint_dir, f'checkpoint_{episode}.pt')
-                torch.save(chk, path)
+                try:
+                    torch.save(chk, path)
+                    print(f"--- Checkpoint saved to {path} (Episode {episode}) ---")
+                except Exception as e:
+                    print(f"ERROR saving checkpoint to {path}: {e}")
 
-            # --- Opponent Updates, Checkpointing, Metrics Saving ---
+            # --- Save Metrics ---
             if episode % self.metrics_save_freq == 0 or episode == self.num_episodes:
-                if metrics_list:
-                    metrics_file = os.path.join(self.checkpoint_dir, "training_metrics.csv")
-                    is_new_file = not os.path.exists(metrics_file)
-                    try:
-                        # open the file and keep it open through all writer calls
-                        with open(metrics_file, "a", newline="") as csvfile:
-                            fieldnames = ['episode', 'reward', 'avg_reward', 'steps', 'epsilon']
-                            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                            if is_new_file:
-                                writer.writeheader()
-                            writer.writerows(metrics_list)
-                        print(f"--- Metrics saved to {metrics_file} (Up to T {episode}) ---")
-                        metrics_list = []
-                    except IOError as e:
-                        print(f"Error saving metrics: {e}")
-        # --- End of Training (Outer loop) ---
+                metrics_file = os.path.join(self.checkpoint_dir, "training_metrics.csv")
+                is_new_file = not os.path.exists(metrics_file)
+                try:
+                    with open(metrics_file, "a", newline="") as csvfile:
+                        # Define fieldnames based on the keys in metrics_list dictionaries
+                        fieldnames = ['episode', 'reward', 'avg_reward', 'agent_steps', 'total_steps', 'epsilon', 'avg_loss', 'duration_sec']
+                        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                        if is_new_file or os.path.getsize(metrics_file) == 0:
+                            writer.writeheader() # Write header only if file is new or empty
+                        writer.writerows(metrics_list) # Write the accumulated metrics
+                    metrics_list.clear() # Clear list after saving
+                except Exception as e:
+                    print(f"ERROR saving metrics to {metrics_file}: {e}")
 
-        # --- Final Saving ---
-        final_checkpoint_path = os.path.join(self.checkpoint_dir, "final_agent_model.pt")
-        try: final_save_dict = { 'episode': self.num_episodes, 'global_step': global_step, 'agent_state_dict': agent.state_dict(), 'target_net_state_dict': target_net.state_dict(), 'optimizer_state_dict': optimizer.state_dict() }; torch.save(final_save_dict, final_checkpoint_path); print(f"\n--- Training complete. Final agent model saved at: {final_checkpoint_path} ---")
-        except Exception as e: print(f"Error saving final agent model: {e}")
-        if metrics_list: # Save remaining metrics
-             metrics_file = os.path.join(self.checkpoint_dir, "training_metrics.csv"); is_new_file = not os.path.exists(metrics_file)
-             try:
-                 with open(metrics_file, "a", newline="") as csvfile: fieldnames = ['episode', 'reward', 'avg_reward', 'steps', 'epsilon']; writer = csv.DictWriter(csvfile, fieldnames=fieldnames);
-                 if is_new_file: writer.writeheader(); writer.writerows(metrics_list); print(f"--- Final metrics batch saved to {metrics_file} ---")
-             except IOError as e: print(f"Error saving final metrics: {e}")
-        if self.env:
-             try: self.env.close(); print("Environment closed.")
-             except Exception as e: print(f"Error closing environment: {e}")
+            # --- Update Opponent Policy ---
+            if episode > start_episode and episode % self.opponent_update_freq == 0 and len(opponent_ids) > 0:
+                # Choose an opponent seat to update (round-robin)
+                seat_to_update = opponent_ids[self.current_update_index % len(opponent_ids)]
+                print(f"\n--- Updating opponent policy at seat {seat_to_update} (Episode {episode}) ---")
+
+                # Find available checkpoints
+                chk_files = [
+                    f for f in os.listdir(self.checkpoint_dir)
+                    if f.startswith("checkpoint_") and f.endswith(".pt")
+                ]
+
+                if chk_files:
+                    # Option: Choose the latest checkpoint
+                    try:
+                        chk_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]), reverse=True)
+                        chosen_chk_file = chk_files[0]
+                    except: # Fallback to alphabetic sort if number parsing fails
+                         chk_files.sort(reverse=True)
+                         chosen_chk_file = chk_files[0] if chk_files else None
+
+                    if chosen_chk_file:
+                        full_path = os.path.join(self.checkpoint_dir, chosen_chk_file)
+                        self.update_one_opponent_from_checkpoint(
+                            seat_to_update, full_path, agent_action_list
+                        )
+                    else:
+                         print("No suitable checkpoint found; skipped opponent rotation.")
+
+                else:
+                    print("No checkpoints found; skipped opponent rotation.")
+
+                self.current_update_index += 1 # Move to the next opponent for the next update
+
+        # --- End of Training ---
+        print("\n--- Training Loop Finished ---")
+
+        # --- Save Final Model ---
+        final_path = os.path.join(self.checkpoint_dir, "final_agent_model.pt")
+        final_dict = {
+            'agent_state_dict': agent.state_dict(),
+            'target_net_state_dict': target_net.state_dict(), # Save final target net too
+            'optimizer_state_dict': optimizer.state_dict(), # Save final optimizer state
+            'episode': self.num_episodes,
+            'global_step': global_step,
+            'action_list': agent_action_list, # Include action list for inference later
+            'current_update_index': self.current_update_index
+        }
+        try:
+            torch.save(final_dict, final_path)
+            print(f"--- Final model saved to {final_path} ---")
+        except Exception as e:
+            print(f"ERROR saving final model to {final_path}: {e}")
+
+        # --- Save any remaining metrics ---
+        if metrics_list:
+            metrics_file = os.path.join(self.checkpoint_dir, "training_metrics.csv")
+            try:
+                with open(metrics_file, "a", newline="") as csvfile:
+                     fieldnames = ['episode', 'reward', 'avg_reward', 'agent_steps', 'total_steps', 'epsilon', 'avg_loss', 'duration_sec']
+                     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                     # Check if header needs writing (e.g., if file didn't exist or was empty)
+                     if not os.path.exists(metrics_file) or os.path.getsize(metrics_file) == 0:
+                          writer.writeheader()
+                     writer.writerows(metrics_list)
+                print(f"--- Final metrics batch saved to {metrics_file} ---")
+            except Exception as e:
+                print(f"ERROR saving final metrics batch to {metrics_file}: {e}")
+
+        # --- Close Environment ---
+        try:
+            if self.env:
+                self.env.close()
+                print("Environment closed.")
+        except Exception as e:
+            print(f"Error closing environment: {e}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train the Poker RL Agent (Tournament Episodes).")
     parser.add_argument("--episodes", type=int, default=10000, help="Total number of training tournaments (episodes).")
-    parser.add_argument("--random", type=str, default=None, help="Tournament range for random policy for opponent 1 (format: start-end).")
-    parser.add_argument("--variable", action="store_true", help="Enable variable training mode for opponent 1.")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint file to resume training from.")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for Adam optimizer.")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for DQN updates.")
+    parser.add_argument("--buffer_size", type=int, default=10000, help="Replay buffer capacity.")
+    parser.add_argument("--target_update", type=int, default=500, help="Frequency (in agent steps) to update target network.")
+    parser.add_argument("--opponent_update", type=int, default=500, help="Frequency (in episodes) to update one opponent model.")
+    parser.add_argument("--save_freq", type=int, default=200, help="Frequency (in episodes) to save checkpoints.")
+    parser.add_argument("--metrics_freq", type=int, default=10, help="Frequency (in episodes) to save metrics.")
+    parser.add_argument("--max_steps", type=int, default=10000, help="Max steps per tournament episode before truncation.")
+
+
     args = parser.parse_args()
-    trainer = Train(episodes=args.episodes, random_range=args.random, variable_mode=args.variable, resume_from=args.resume)
+
+    # Pass relevant args to Train constructor/attributes
+    trainer = Train(episodes=args.episodes,
+                    resume_from=args.resume)
+
+    # Override defaults with args
+    trainer.learning_rate = args.lr
+    trainer.batch_size = args.batch_size
+    trainer.buffer_capacity = args.buffer_size
+    trainer.target_update_freq = args.target_update
+    trainer.opponent_update_freq = args.opponent_update
+    trainer.checkpoint_save_freq = args.save_freq
+    trainer.metrics_save_freq = args.metrics_freq
+    trainer.max_steps_per_tournament = args.max_steps
+
+    print("\n--- Training Configuration ---")
+    print(f"Total Episodes: {args.episodes}")
+    print(f"Resume Checkpoint: {args.resume}")
+    print(f"Learning Rate: {trainer.learning_rate}")
+    print(f"Batch Size: {trainer.batch_size}")
+    print(f"Buffer Capacity: {trainer.buffer_capacity}")
+    print(f"Target Update Freq (steps): {trainer.target_update_freq}")
+    print(f"Opponent Update Freq (episodes): {trainer.opponent_update_freq}")
+    print(f"Checkpoint Save Freq (episodes): {trainer.checkpoint_save_freq}")
+    print(f"Metrics Save Freq (episodes): {trainer.metrics_save_freq}")
+    print(f"Max Steps per Episode: {trainer.max_steps_per_tournament}")
+    print(f"Device: {trainer.device}")
+    print("----------------------------\n")
+
     trainer.run()

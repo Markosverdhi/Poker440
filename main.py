@@ -2,9 +2,17 @@ import argparse
 import sys
 import os
 
+# Ensure the project root is in the Python path
 project_root = os.path.dirname(os.path.abspath(__file__))
 if project_root not in sys.path:
+    # Insert project root for relative imports (like Back_End, Front_End, Scripts)
     sys.path.insert(0, project_root)
+    # Also insert the directory containing Back_End etc. if main.py is nested deeper
+    # Example: If main.py is in a 'src' folder, you might need:
+    # parent_dir = os.path.dirname(project_root)
+    # if parent_dir not in sys.path:
+    #    sys.path.insert(0, parent_dir)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -18,105 +26,78 @@ def main():
                                             "  analyze  - Analyze detailed simulation logs.\n"
                                             "  ui       - Run the graphical user interface.")
 
+    # --- Train Sub-parser ---
     train_parser = subparsers.add_parser("train", help="Train the RL agent.")
-    train_parser.add_argument(
-        "--episodes", type=int, default=100000,
-        help="Total number of training tournaments (episodes)."
-    )
-    train_parser.add_argument(
-        "--random", type=str, default=None,
-        help="Tournament range for using random policy for opponent 1 (format: start-end)."
-    )
-    train_parser.add_argument(
-        "--variable", action="store_true",
-        help="Enable variable training mode for opponent 1 (switch between model and random periodically)."
-    )
-    train_parser.add_argument(
-        "--resume", type=str, default=None,
-        help="Path to an existing model checkpoint file (.pt) to resume training from."
-    )
+    # Arguments matching the __main__ block of train.py
+    train_parser.add_argument("--episodes", type=int, default=10000, help="Total number of training tournaments (episodes).")
+    train_parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint file to resume training from.")
+    train_parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for Adam optimizer.")
+    train_parser.add_argument("--batch_size", type=int, default=64, help="Batch size for DQN updates.")
+    train_parser.add_argument("--buffer_size", type=int, default=10000, help="Replay buffer capacity.")
+    train_parser.add_argument("--target_update", type=int, default=500, help="Frequency (in agent steps) to update target network.")
+    train_parser.add_argument("--opponent_update", type=int, default=500, help="Frequency (in episodes) to update one opponent model.")
+    train_parser.add_argument("--save_freq", type=int, default=200, help="Frequency (in episodes) to save checkpoints.")
+    train_parser.add_argument("--metrics_freq", type=int, default=10, help="Frequency (in episodes) to save metrics.")
+    train_parser.add_argument("--max_steps", type=int, default=10000, help="Max steps per tournament episode before truncation.")
+    # Removed obsolete --random and --variable arguments
 
+    # --- Simulate Sub-parser ---
     simulate_parser = subparsers.add_parser("simulate", help="Simulate/evaluate the trained RL agent.")
-    simulate_parser.add_argument(
-        "--checkpoint", type=str, required=True,
-        help="Path to the trained model checkpoint (.pt) REQUIRED for simulation."
-    )
-    simulate_parser.add_argument(
-        "--episodes", type=int, default=10,
-        help="Number of simulation episodes (tournaments) to run."
-    )
-    simulate_parser.add_argument(
-        "--opponent", type=str, default="model", choices=["model", "random", "variable"],
-        help="Default type of opponent to use if --seat_config is not provided."
-    )
-    simulate_parser.add_argument(
-        "--seat_config", type=str, default="",
-        help="Comma-separated list for each seat (0 to NUM_PLAYERS-1). "
-             "Seat 0 must be 'agent'; others can be 'model', 'random', 'variable', or 'empty'."
-    )
-    simulate_parser.add_argument(
-        "--detailed_log", type=str, default="detailed_simulation_log.csv",
-        help="Path to the CSV file to store detailed game state and action logs."
-    )
-    simulate_parser.add_argument(
-        "--output_csv", type=str, default="simulation_results.csv",
-         help="Path to the CSV file to store simulation summary results."
-    )
+    simulate_parser.add_argument("--checkpoint", type=str, required=True, help="Path to the trained model checkpoint (.pt) REQUIRED for simulation.")
+    simulate_parser.add_argument("--episodes", type=int, default=10, help="Number of simulation episodes (tournaments) to run.")
+    simulate_parser.add_argument("--opponent", type=str, default="model", choices=["model", "random", "variable"], help="Default type of opponent to use if --seat_config is not provided.") # Note: 'variable' might need specific handling in simulate.py
+    simulate_parser.add_argument("--seat_config", type=str, default="", help="Comma-separated list for each seat (0 to NUM_PLAYERS-1). Seat 0 must be 'agent'; others can be 'model', 'random', 'variable', or 'empty'.")
+    simulate_parser.add_argument("--detailed_log", type=str, default="detailed_simulation_log.csv", help="Path to the CSV file to store detailed game state and action logs.")
+    simulate_parser.add_argument("--output_csv", type=str, default="simulation_results.csv", help="Path to the CSV file to store simulation summary results.")
 
+    # --- Analyze Sub-parser ---
     analyze_parser = subparsers.add_parser("analyze", help="Analyze detailed simulation logs and compare decisions.")
-    analyze_parser.add_argument(
-        "--detailed_log", type=str, default="detailed_simulation_log.csv", required=True,
-        help="Path to the detailed simulation log CSV file generated by 'simulate'."
-    )
-    analyze_parser.add_argument(
-        "--output_analysis", type=str, default="decision_analysis_summary.csv",
-        help="Path to save the analysis summary."
-    )
-    analyze_parser.add_argument(
-        "--agent_id", type=int, default=1,
-        help="Player ID (1-based) of the agent to analyze."
-    )
+    analyze_parser.add_argument("--detailed_log", type=str, default="detailed_simulation_log.csv", required=True, help="Path to the detailed simulation log CSV file generated by 'simulate'.")
+    analyze_parser.add_argument("--output_analysis", type=str, default="decision_analysis_summary.csv", help="Path to save the analysis summary.")
+    analyze_parser.add_argument("--agent_id", type=int, default=1, help="Player ID (1-based) of the agent to analyze.") # Note: Env uses 0-based, ensure consistency
 
+    # --- UI Sub-parser ---
     ui_parser = subparsers.add_parser("ui", help="Run the graphical user interface.")
-    ui_parser.add_argument(
-        "--theme", type=str, default="dark", choices=["dark", "light"],
-        help="UI theme to use (dark or light)"
-    )
-    ui_parser.add_argument(
-        "--animation_speed", type=float, default=1.0,
-        help="Animation speed multiplier (0.5 = half speed, 2.0 = double speed)"
-    )
-    ui_parser.add_argument(
-        "--fullscreen", action="store_true",
-        help="Launch the UI in fullscreen mode"
-    )
+    ui_parser.add_argument("--theme", type=str, default="dark", choices=["dark", "light"], help="UI theme to use (dark or light)")
+    ui_parser.add_argument("--animation_speed", type=float, default=1.0, help="Animation speed multiplier (0.5 = half speed, 2.0 = double speed)")
+    ui_parser.add_argument("--fullscreen", action="store_true", help="Launch the UI in fullscreen mode")
 
     args = parser.parse_args()
 
+    # --- Command Execution ---
     if args.command == "train":
         try:
+            # Assuming train.py is in a 'Scripts' subdirectory relative to project_root
             from Scripts.train import Train
-        except ImportError:
-            try:
-                from Scripts.train import Train
-            except ImportError as e:
-                print(f"Error: Could not import Train: {e}")
-                print("Ensure the folder structure is correct and __init__.py exists if needed.")
-                sys.exit(1)
+        except ImportError as e:
+            print(f"Error: Could not import Train from Scripts.train: {e}")
+            print("Ensure the folder structure is correct (e.g., main.py, Scripts/train.py) and __init__.py exists if needed.")
+            sys.exit(1)
 
         print("Starting training process...")
+        # Correctly instantiate Train with only accepted arguments
         trainer = Train(
             episodes=args.episodes,
-            random_range=args.random,
-            variable_mode=args.variable,
             resume_from=args.resume
         )
+
+        # Set hyperparameters from args after instantiation
+        trainer.learning_rate = args.lr
+        trainer.batch_size = args.batch_size
+        trainer.buffer_capacity = args.buffer_size
+        trainer.target_update_freq = args.target_update
+        trainer.opponent_update_freq = args.opponent_update
+        trainer.checkpoint_save_freq = args.save_freq
+        trainer.metrics_save_freq = args.metrics_freq
+        trainer.max_steps_per_tournament = args.max_steps
+
         trainer.run()
         print("Training finished.")
 
     elif args.command == "simulate":
         print("Starting simulation process...")
-        new_argv = [sys.argv[0]]
+        # Construct arguments for simulate.py
+        new_argv = [sys.argv[0]] # Script name placeholder
         new_argv += ["--checkpoint", args.checkpoint]
         new_argv += ["--episodes", str(args.episodes)]
         new_argv += ["--opponent", args.opponent]
@@ -128,81 +109,95 @@ def main():
              new_argv += ["--output_csv", args.output_csv]
 
         original_argv = sys.argv
-        simulate_script_path = os.path.join(project_root, 'Back_End', 'Scripts', 'simulate.py')
-        sys.argv = [simulate_script_path] + new_argv[1:]
+        # Assuming simulate.py is in 'Scripts' subdirectory
+        simulate_script_path = os.path.join(project_root, 'Scripts', 'simulate.py')
+        sys.argv = [simulate_script_path] + new_argv[1:] # Set sys.argv for the simulate script
 
         try:
-            try:
-                from Scripts.simulate import main as simulate_main
-            except ImportError:
-                from Scripts.simulate import main as simulate_main
+            # Import and run the main function from simulate.py
+            from Scripts.simulate import main as simulate_main
             simulate_main()
         except ImportError as e:
-             print(f"Error: Could not import simulate: {e}")
+             print(f"Error: Could not import simulate from Scripts.simulate: {e}")
              print("Ensure the folder structure is correct and __init__.py exists if needed.")
              sys.exit(1)
         except SystemExit as e:
              if e.code != 0: print(f"Exiting due to error in simulate script (code: {e.code}).")
         finally:
-             sys.argv = original_argv
+             sys.argv = original_argv # Restore original sys.argv
         print("Simulation finished.")
 
     elif args.command == "analyze":
         print("Starting analysis process...")
-        new_argv = [sys.argv[0]]
+        # Construct arguments for decision_analysis.py
+        new_argv = [sys.argv[0]] # Script name placeholder
         new_argv += ["--detailed_log", args.detailed_log]
         new_argv += ["--output_analysis", args.output_analysis]
         new_argv += ["--agent_id", str(args.agent_id)]
 
         original_argv = sys.argv
-        analyze_script_path = os.path.join(project_root, 'Back_End', 'Scripts', 'decision_analysis.py')
-        sys.argv = [analyze_script_path] + new_argv[1:]
+        # Assuming decision_analysis.py is in 'Scripts' subdirectory
+        analyze_script_path = os.path.join(project_root, 'Scripts', 'decision_analysis.py')
+        sys.argv = [analyze_script_path] + new_argv[1:] # Set sys.argv for the analysis script
 
         try:
-            try:
-                from Scripts.decision_analysis import main as analyze_main
-            except ImportError:
-                from Scripts.decision_analysis import main as analyze_main
+            # Import and run the main function from decision_analysis.py
+            from Scripts.decision_analysis import main as analyze_main
             analyze_main()
         except ImportError as e:
-             print(f"Error: Could not import decision_analysis: {e}")
+             print(f"Error: Could not import decision_analysis from Scripts.decision_analysis: {e}")
              print("Ensure the folder structure is correct and __init__.py exists if needed.")
              sys.exit(1)
         except SystemExit as e:
              if e.code != 0: print(f"Exiting due to error in analysis script (code: {e.code}).")
         finally:
-             sys.argv = original_argv
+             sys.argv = original_argv # Restore original sys.argv
         print("Analysis finished.")
 
     elif args.command == "ui":
         print("Launching Enhanced Poker UI...")
         try:
             import tkinter as tk
-            try:
-                from Front_End.main_ui import PokerApp
-            except ImportError:
-                from Front_End.main_ui import PokerApp
+            # Assuming main_ui.py is in 'Front_End' subdirectory
+            from Front_End.main_ui import PokerApp
         except ImportError as e:
             print(f"Error: Could not import UI components: {e}")
-            print("Ensure tkinter is installed and the folder structure is correct.")
+            print("Ensure tkinter is installed and the folder structure (e.g., Front_End/main_ui.py) is correct.")
             sys.exit(1)
 
         try:
             root = tk.Tk()
-            root.withdraw()
-            
+            # Optional: Set icon, min size etc.
+            # root.iconbitmap('path/to/icon.ico') # Example
+            root.minsize(800, 600) # Example minimum size
+
             root.title("Enhanced Poker Game")
-            
+
             if args.fullscreen:
                 root.attributes('-fullscreen', True)
-            
-            app = PokerApp(root)
-            
-            if hasattr(app, 'animation_manager') and hasattr(args, 'animation_speed'):
+                # Optional: Bind Escape key to exit fullscreen
+                root.bind("<Escape>", lambda event: root.attributes("-fullscreen", False))
+
+
+            app = PokerApp(root) # Pass root window to the app
+
+            # Apply theme if implemented in PokerApp
+            if hasattr(app, 'apply_theme'):
+                 app.apply_theme(args.theme)
+
+            # Set animation speed if implemented
+            if hasattr(app, 'animation_manager') and hasattr(app.animation_manager, 'set_animation_speed'):
                 app.animation_manager.set_animation_speed(args.animation_speed)
-            
-            root.deiconify()
-            root.mainloop()
+
+            # Center the window (optional, do after setting size/fullscreen)
+            # root.update_idletasks() # Ensure window dimensions are calculated
+            # width = root.winfo_width()
+            # height = root.winfo_height()
+            # x = (root.winfo_screenwidth() // 2) - (width // 2)
+            # y = (root.winfo_screenheight() // 2) - (height // 2)
+            # root.geometry(f'{width}x{height}+{x}+{y}')
+
+            root.mainloop() # Start the Tkinter event loop
         except Exception as e:
             print(f"Error launching enhanced UI: {e}")
             import traceback
