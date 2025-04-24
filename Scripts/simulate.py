@@ -5,23 +5,14 @@ simulate.py
 Simulates games using a trained Poker RL Agent against configured opponents
 using the Gymnasium-compliant BaseFullPokerEnv (adapted for tournament play).
 
-MODIFIED (Fix UnboundLocalError):
-- Restructured opponent setup logic.
-
-MODIFIED (Fix Model Instantiation TypeError):
-- Removed the unexpected 'input_dim' keyword argument when instantiating
-  BestPokerModel in the main function, consistent with updated models.py.
-
-MODIFIED (Refactoring):
-- Removed local `get_opponent_policy` function.
-- Removed local model loading logic.
-- Imported `load_agent_model` and `get_opponent_policy` from `utils.py`.
-- Updated `main` to use imported functions.
-
-MODIFIED (Fix Detailed Logging):
-- Changed header from "StepReward" to "Reward".
-- Moved detailed logging to *after* env.step() for the agent.
-- Logged the actual reward obtained from env.step().
+MODIFIED (Add 'eval' opponent type):
+- Added 'eval' choice to --opponent argument.
+- Updated main function to handle 'eval' type:
+    - Looks for checkpoints in './checkpoints/'.
+    - Randomly selects a checkpoint file (.pt).
+    - Loads the model from the selected checkpoint.
+    - Uses the loaded model for the opponent policy.
+    - Falls back to 'random' if no checkpoints are found.
 """
 
 import os
@@ -31,6 +22,7 @@ import numpy as np
 import random
 import csv
 import json
+import glob # Import glob for finding files
 
 # Import Gymnasium-compliant environment and updated utils
 try:
@@ -58,6 +50,7 @@ ACTION_LIST = ['fold', 'call', 'check', 'bet_small', 'bet_big', 'all_in'] # Defa
 NUM_ACTIONS = len(ACTION_LIST)
 action_to_string = {i: s for i, s in enumerate(ACTION_LIST)}
 string_to_action = {s: i for i, s in enumerate(ACTION_LIST)}
+CHECKPOINT_DIR = "checkpoints" # Define checkpoint directory
 
 # Attempt to get action list from env dynamically
 try:
@@ -81,13 +74,13 @@ except Exception as e:
 
 
 def parse_args():
-    # (Argument parsing remains the same)
     parser = argparse.ArgumentParser(description="Simulate/Evaluate the trained Poker RL Agent (Tournament Mode).")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to the trained model checkpoint (.pt) REQUIRED for simulation.")
     parser.add_argument("--episodes", type=int, default=10, help="Number of simulation episodes (tournaments) to run.")
-    parser.add_argument("--opponent", type=str, default="model", choices=["model", "random", "variable"], help="Default type of opponent to use if --seat_config is not provided.")
+    # *** ADDED 'eval' to choices ***
+    parser.add_argument("--opponent", type=str, default="model", choices=["model", "random", "variable", "eval"], help="Default type of opponent to use if --seat_config is not provided.")
     parser.add_argument("--output_csv", type=str, default="Output_CSVs/simulation_results.csv", help="Path to the CSV file to store simulation summary results.")
-    parser.add_argument("--seat_config", type=str, default="", help="Comma-separated list for each seat (0 to NUM_PLAYERS-1). Seat 0 must be 'agent'. Example: 'agent,model,random,model,random,model'")
+    parser.add_argument("--seat_config", type=str, default="", help="Comma-separated list for each seat (0 to NUM_PLAYERS-1). Seat 0 must be 'agent'. Example: 'agent,model,random,eval,random,model'")
     parser.add_argument("--detailed_log", type=str, default="Output_CSVs/detailed_simulation_log.csv", help="Path to the CSV file to store detailed game state and action logs.")
     return parser.parse_args()
 
@@ -120,10 +113,10 @@ def simulate_episode(env: BaseFullPokerEnv, agent: torch.nn.Module, episode: int
         is_empty_seat = env.seat_config.get(current_player_id) == 'empty'
 
         if current_player_id is None or is_empty_seat:
-             # If turn is on an empty seat or invalid, step with dummy action to advance
-             action_idx = -1
-             action_str = "SKIP (Empty/Invalid)"
-             # print(f"Debug: Skipping turn for player {current_player_id} (Empty/Invalid)") # Debug
+            # If turn is on an empty seat or invalid, step with dummy action to advance
+            action_idx = -1
+            action_str = "SKIP (Empty/Invalid)"
+            # print(f"Debug: Skipping turn for player {current_player_id} (Empty/Invalid)") # Debug
         elif current_player_id == env.agent_id:
             agent_took_action_this_step = True # Mark that the agent is determining an action
             try:
@@ -148,8 +141,8 @@ def simulate_episode(env: BaseFullPokerEnv, agent: torch.nn.Module, episode: int
                     if potential_action_str is not None and potential_action_str in legal_actions_list:
                         action_idx = idx; action_str = potential_action_str; break
                 if action_idx == -1: # Fallback if no legal action found in Q-values
-                     action_str = random.choice(legal_actions_list); action_idx = string_to_action.get(action_str, 0)
-                     print(f"Warning: Agent model failed to find legal action, chose random: {action_str}")
+                    action_str = random.choice(legal_actions_list); action_idx = string_to_action.get(action_str, 0)
+                    print(f"Warning: Agent model failed to find legal action, chose random: {action_str}")
 
             # --- Logging moved AFTER env.step() ---
 
@@ -172,20 +165,20 @@ def simulate_episode(env: BaseFullPokerEnv, agent: torch.nn.Module, episode: int
 
         # --- Log Agent's Action AFTER Stepping ---
         if agent_took_action_this_step and detailed_writer:
-             # Use the obs_dict captured *before* the step, but reward from *after* the step
-             agent_pos = current_obs_dict.get('position', 'N/A'); # Position might not be in obs_dict
-             # RFI opportunity requires more context from env state, not just obs_dict
-             is_rfi = False # Placeholder - TODO: Get this info from env state if needed
-             raiser_pos = env.last_raiser if hasattr(env, 'last_raiser') else None # Get from env state
-             try: obs_json = json.dumps(current_obs_dict, sort_keys=True, default=str)
-             except Exception as e: print(f"Error serializing obs_dict: {e}"); obs_json = "{'error': 'logging failed'}"
-             # Log the actual step_reward
-             detailed_writer.writerow([
-                 episode, step_count, env.agent_id + 1, action_str,
-                 f"{step_reward:.2f}", # Use actual reward
-                 obs_json, agent_pos, is_rfi,
-                 raiser_pos if raiser_pos is not None else "N/A"
-             ])
+            # Use the obs_dict captured *before* the step, but reward from *after* the step
+            agent_pos = current_obs_dict.get('position', 'N/A'); # Position might not be in obs_dict
+            # RFI opportunity requires more context from env state, not just obs_dict
+            is_rfi = False # Placeholder - TODO: Get this info from env state if needed
+            raiser_pos = env.last_raiser if hasattr(env, 'last_raiser') else None # Get from env state
+            try: obs_json = json.dumps(current_obs_dict, sort_keys=True, default=str)
+            except Exception as e: print(f"Error serializing obs_dict: {e}"); obs_json = "{'error': 'logging failed'}"
+            # Log the actual step_reward
+            detailed_writer.writerow([
+                episode, step_count, env.agent_id + 1, action_str,
+                f"{step_reward:.2f}", # Use actual reward
+                obs_json, agent_pos, is_rfi,
+                raiser_pos if raiser_pos is not None else "N/A"
+            ])
 
 
         # Accumulate reward (env.step now returns round reward at round end)
@@ -197,16 +190,16 @@ def simulate_episode(env: BaseFullPokerEnv, agent: torch.nn.Module, episode: int
     # Ensure final tournament reward is captured correctly (might be in last_info already)
     final_reward_from_info = final_info.get('final_tournament_reward', None)
     if final_reward_from_info is not None:
-         tournament_reward = final_reward_from_info
+        tournament_reward = final_reward_from_info
     else:
-         # Calculate from stack change if not provided directly
-         if env.agent_id in env.stacks and env.agent_id in env.initial_stacks_this_round:
-              final_stack = env.stacks.get(env.agent_id, 0)
-              # Need initial stack *at tournament start* - env doesn't track this easily
-              # Use accumulated step rewards as best estimate if final not given
-              final_info['calculated_tournament_reward'] = tournament_reward
-         else:
-              final_info['final_tournament_reward'] = tournament_reward
+        # Calculate from stack change if not provided directly
+        if env.agent_id in env.stacks and env.agent_id in env.initial_stacks_this_round:
+            final_stack = env.stacks.get(env.agent_id, 0)
+            # Need initial stack *at tournament start* - env doesn't track this easily
+            # Use accumulated step rewards as best estimate if final not given
+            final_info['calculated_tournament_reward'] = tournament_reward
+        else:
+            final_info['final_tournament_reward'] = tournament_reward
 
 
     print(f"--- Finished Simulation Tournament {episode}. Final Reward: {tournament_reward:.2f} ---")
@@ -238,7 +231,10 @@ def main():
         if seat_config_list[0] != "agent":
             print("Error: Seat 0 (index 0) in --seat_config must be 'agent'."); exit(1)
         for i, seat_type in enumerate(seat_config_list):
-             seat_config_dict[i] = seat_type
+            # *** ADDED 'eval' to allowed types ***
+            if seat_type not in ["agent", "model", "random", "variable", "eval", "empty"]:
+                print(f"Error: Invalid seat type '{seat_type}' in --seat_config. Allowed: agent, model, random, variable, eval, empty"); exit(1)
+            seat_config_dict[i] = seat_type
     else:
         # Default config: agent at seat 0, others based on --opponent arg
         seat_config_dict[0] = "agent"
@@ -259,23 +255,73 @@ def main():
         )
     except Exception as e: print(f"Error initializing environment: {e}"); exit(1)
 
-    # --- Opponent Setup using centralized function ---
+    # --- Opponent Setup ---
+    # *** MODIFIED to handle 'eval' type ***
     for seat_id in range(NUM_PLAYERS):
         if seat_id == env.agent_id: continue # Skip agent seat
         opp_type = seat_config_dict.get(seat_id)
         if opp_type == 'empty': continue # Skip empty seats
 
+        policy_func = None
+        opponent_model_instance = None # Specific model instance for this seat
+        policy_info_str = opp_type # Default info string
+
+        if opp_type == 'eval':
+            # Find checkpoints
+            checkpoint_files = glob.glob(os.path.join(CHECKPOINT_DIR, "checkpoint_*.pt"))
+            if not checkpoint_files:
+                print(f"Warning: No checkpoints found in '{CHECKPOINT_DIR}' for eval opponent at seat {seat_id+1}. Using 'random'.")
+                opp_type = 'random' # Fallback to random
+                policy_info_str = f"{opp_type} (fallback)"
+            else:
+                # Select a random checkpoint
+                selected_checkpoint = random.choice(checkpoint_files)
+                print(f"Seat {seat_id+1} ('eval'): Loading random checkpoint '{os.path.basename(selected_checkpoint)}'")
+                try:
+                    # Load the model state dict directly
+                    checkpoint_data = torch.load(selected_checkpoint, map_location=device)
+                    # Handle dict or raw state_dict
+                    state_dict = checkpoint_data.get('agent_state_dict', checkpoint_data) if isinstance(checkpoint_data, dict) else checkpoint_data
+                    if not isinstance(state_dict, dict): raise TypeError("Loaded state is not a dict.")
+
+                    # Clean 'module.' prefix if needed
+                    cleaned_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+                    # Create a new model instance for this opponent
+                    opponent_model_instance = BestPokerModel(num_actions=NUM_ACTIONS).to(device)
+                    load_info = opponent_model_instance.load_state_dict(cleaned_state_dict, strict=False) # Use strict=False for flexibility
+                    if load_info.missing_keys or load_info.unexpected_keys:
+                         print(f"  Load info for seat {seat_id+1}: Missing={load_info.missing_keys}, Unexpected={load_info.unexpected_keys}")
+                    opponent_model_instance.eval()
+
+                    # Now use the 'model' logic in get_opponent_policy, passing the loaded model
+                    opp_type = 'model' # Treat as model type for policy creation
+                    policy_info_str = f"eval ({os.path.basename(selected_checkpoint)})"
+
+                except Exception as e:
+                    print(f"Error loading checkpoint {os.path.basename(selected_checkpoint)} for seat {seat_id+1}: {e}. Using 'random'.")
+                    opp_type = 'random' # Fallback to random on error
+                    policy_info_str = f"{opp_type} (fallback - load error)"
+                    opponent_model_instance = None # Ensure no model is used
+
         # Get policy using the centralized function
+        # Pass the specifically loaded model if opp_type is now 'model' (from 'eval')
+        # Pass the main agent model if original opp_type was 'model'
+        model_to_use = opponent_model_instance if opponent_model_instance is not None else agent
+
         policy_func = get_opponent_policy(
-            opponent_type=opp_type,
-            agent_model=agent, # Pass the loaded agent model
+            opponent_type=opp_type, # Use potentially modified type ('model' or 'random')
+            agent_model=model_to_use, # Use the appropriate model
             action_list=ACTION_LIST,
             num_actions=NUM_ACTIONS,
             device=device
         )
-        env.set_opponent_policy(seat_id, policy_func)
-        print(f"Set Seat {seat_id+1} policy to: {opp_type}")
 
+        if policy_func:
+            env.set_opponent_policy(seat_id, policy_func)
+            print(f"Set Seat {seat_id+1} policy to: {policy_info_str}")
+        else:
+            print(f"Warning: Could not get policy for seat {seat_id+1} (type: {opp_type}). Check utils.get_opponent_policy.")
 
     # --- Setup Logging (Header Fixed) ---
     summary_file_path = args.output_csv; detailed_file_path = args.detailed_log
@@ -288,8 +334,8 @@ def main():
         # Write header only if file doesn't exist or is empty
         file_exists = os.path.exists(summary_file_path) and os.path.getsize(summary_file_path) > 0
         with open(summary_file_path, mode='a', newline='') as sf:
-             sw = csv.writer(sf)
-             if not file_exists: sw.writerow(summary_header)
+            sw = csv.writer(sf)
+            if not file_exists: sw.writerow(summary_header)
     except IOError as e: print(f"Error opening summary CSV {summary_file_path}: {e}. Summary logging disabled."); summary_file_path = None
 
     try:
@@ -313,18 +359,18 @@ def main():
         total_reward_all_tournaments += ep_reward
         if summary_file_path:
             try:
-                 # Attempt to serialize final_info safely
-                 info_str = json.dumps(final_info, default=str)
+                # Attempt to serialize final_info safely
+                info_str = json.dumps(final_info, default=str)
             except TypeError as e:
-                 print(f"Warning: Could not serialize final_info for T {ep}: {e}. Storing basic info.")
-                 info_str = json.dumps({'error': 'info serialization failed', 'final_reward_calc': ep_reward}, default=str)
+                print(f"Warning: Could not serialize final_info for T {ep}: {e}. Storing basic info.")
+                info_str = json.dumps({'error': 'info serialization failed', 'final_reward_calc': ep_reward}, default=str)
 
             try:
-                 with open(summary_file_path, mode='a', newline='') as sf:
-                     sw = csv.writer(sf); sw.writerow([ep, f"{ep_reward:.2f}", info_str])
+                with open(summary_file_path, mode='a', newline='') as sf:
+                    sw = csv.writer(sf); sw.writerow([ep, f"{ep_reward:.2f}", info_str])
             except IOError as e: print(f"Error writing summary T {ep}: {e}")
 
-        if ep % max(1, args.episodes // 10) == 0: print(f"  Completed Tournament {ep}/{args.episodes}...")
+        if ep % max(1, args.episodes // 10) == 0: print(f"  Completed Tournament {ep}/{args.episodes}...")
 
     avg_reward = total_reward_all_tournaments / args.episodes if args.episodes > 0 else 0.0
     print(f"\n--- Simulation Complete ---"); print(f"Average Tournament Reward: {avg_reward:.2f}")
