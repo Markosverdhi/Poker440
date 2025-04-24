@@ -1,3 +1,4 @@
+# filename: train.py
 import os
 import random
 import csv
@@ -27,6 +28,8 @@ except ImportError as e:
 # --- Constants ---
 # NUM_PLAYERS should ideally match the environment's default or be configurable
 NUM_PLAYERS = 6
+# *** ADDED: Threshold for skipping slow episodes ***
+MAX_EPISODE_DURATION_SEC = 30.0
 
 
 class Train:
@@ -73,7 +76,7 @@ class Train:
                 # Ensure encode_obs handles the opponent's observation format correctly
                 state = encode_obs(obs_dict) # Relies on utils.encode_obs
             except Exception as e:
-                print(f"Error encoding opponent obs: {e}. Folding.")
+                # print(f"Error encoding opponent obs: {e}. Folding.") # Less verbose
                 return 'fold'
 
             state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -206,6 +209,43 @@ class Train:
             # Optionally set to random here, or just let it keep its current policy
             # self.env.set_opponent_policy(opponent_id, self.random_policy)
 
+    # *** ADDED: Helper method to trigger opponent update ***
+    def _trigger_opponent_update(self, episode, opponent_ids, agent_action_list):
+        """Selects an opponent and updates their policy from the latest checkpoint."""
+        if not opponent_ids: return # No opponents to update
+
+        # Choose an opponent seat to update (round-robin)
+        seat_to_update = opponent_ids[self.current_update_index % len(opponent_ids)]
+        print(f"\n--- Updating opponent policy at seat {seat_to_update} (Triggered at Episode {episode}) ---")
+
+        # Find available checkpoints
+        chk_files = [
+            f for f in os.listdir(self.checkpoint_dir)
+            if f.startswith("checkpoint_") and f.endswith(".pt")
+        ]
+
+        if chk_files:
+            # Option: Choose the latest checkpoint
+            try:
+                chk_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]), reverse=True)
+                chosen_chk_file = chk_files[0]
+            except: # Fallback to alphabetic sort if number parsing fails
+                 chk_files.sort(reverse=True)
+                 chosen_chk_file = chk_files[0] if chk_files else None
+
+            if chosen_chk_file:
+                full_path = os.path.join(self.checkpoint_dir, chosen_chk_file)
+                self.update_one_opponent_from_checkpoint(
+                    seat_to_update, full_path, agent_action_list
+                )
+            else:
+                 print("No suitable checkpoint found; skipped opponent rotation.")
+
+        else:
+            print("No checkpoints found; skipped opponent rotation.")
+
+        self.current_update_index += 1 # Move to the next opponent for the next update
+
 
     def run(self):
         """Main training loop."""
@@ -313,6 +353,8 @@ class Train:
         for episode in range(start_episode, self.num_episodes + 1):
             episode_start_time = time.time()
             episode_reward_cumulative = 0.0 # Track cumulative reward *within* this episode
+            episode_round_rewards = []
+            num_rounds_in_episode = 0
 
             try:
                 # Reset environment for a new tournament (episode)
@@ -342,8 +384,6 @@ class Train:
                 if tournament_total_steps >= self.max_steps_per_tournament:
                     print(f"WARNING: Tournament {episode} exceeded max steps ({self.max_steps_per_tournament}). Truncating episode.")
                     truncated = True # Use truncated flag
-                    # Apply penalty if desired for truncation
-                    # episode_reward_cumulative -= 1000
                     break # Exit the inner while loop
 
                 # Determine whose turn it is (assuming env updates this)
@@ -363,57 +403,46 @@ class Train:
                         if not legal:
                             # This might happen if agent is already all-in but somehow gets turn
                             print(f"Warning: Agent {self.env.agent_id} has no legal actions in T {episode}, Step {tournament_total_steps}. Env issue? Forcing check/fold.")
-                            # Attempt to find a safe default, or terminate if state seems invalid
-                            if 'check' in self.env._get_legal_actions(current_player): # Check internal state if needed
+                            if 'check' in self.env._get_legal_actions(current_player):
                                 action_idx = string_to_action.get('check', 0)
                             else:
                                 action_idx = string_to_action.get('fold', 0)
 
                         else:
                             # Epsilon-Greedy Action Selection
-                            epsilon = epsilon_by_frame(global_step) # Get current exploration rate
+                            epsilon = epsilon_by_frame(global_step)
                             if random.random() < epsilon:
-                                # Exploration: Choose a random legal action
                                 action_str = random.choice(legal)
-                                action_idx = string_to_action.get(action_str, 0) # Default to 0 if string not found
+                                action_idx = string_to_action.get(action_str, 0)
                             else:
-                                # Exploitation: Choose the best legal action based on Q-values
                                 state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-                                agent.eval() # Set model to evaluation mode for inference
+                                agent.eval()
                                 with torch.no_grad():
                                     q_vals = agent(state_tensor).squeeze().cpu().numpy()
-                                agent.train() # Set model back to training mode
-
-                                # Find the best *legal* action index
+                                agent.train()
                                 best_legal_action_idx = -1
                                 best_q_val = -float('inf')
                                 for act_str in legal:
                                     idx = string_to_action.get(act_str)
-                                    if idx is not None and idx < len(q_vals): # Check index bounds
+                                    if idx is not None and idx < len(q_vals):
                                         if q_vals[idx] > best_q_val:
                                             best_q_val = q_vals[idx]
                                             best_legal_action_idx = idx
                                     else:
                                         print(f"Warning: Action string '{act_str}' or index {idx} invalid for Q-values.")
 
-
                                 if best_legal_action_idx != -1:
                                     action_idx = best_legal_action_idx
                                 else:
-                                    # Fallback if something went wrong
                                     print(f"Warning: Could not find best legal action via Q-values for agent in T {episode}, Step {tournament_total_steps}. Choosing random from {legal}.")
                                     action_str = random.choice(legal)
                                     action_idx = string_to_action.get(action_str, 0)
 
                         # --- Environment Step (Agent) ---
-                        # Execute the chosen action
-                        # Expect env.step to return: next_state, immediate_reward, terminated, truncated, info
                         next_state, step_reward, terminated, truncated, info = self.env.step(action_idx)
 
                         # --- Store Experience in Replay Buffer ---
-                        # ** CRITICAL: Using the immediate step_reward returned by env.step **
                         if isinstance(state, np.ndarray) and isinstance(next_state, np.ndarray):
-                             # The reward stored is the immediate reward from the agent's action
                              replay_buffer.push(state, action_idx, step_reward, next_state, float(terminated or truncated))
                         else:
                              print(f"Warning: Invalid state ({type(state)}) or next_state ({type(next_state)}) type during agent step {tournament_total_steps}. Skipping buffer push.")
@@ -423,100 +452,95 @@ class Train:
 
                         # --- DQN Learning Update ---
                         if len(replay_buffer) >= self.batch_size:
-                            # Sample a batch from the replay buffer
                             (states_b, actions_b, rewards_b,
                              next_states_b, dones_b) = replay_buffer.sample(self.batch_size)
-
-                            # Convert batch to tensors
                             states_t = torch.tensor(states_b, dtype=torch.float32, device=self.device)
-                            actions_t = torch.tensor(actions_b, dtype=torch.long, device=self.device).unsqueeze(1) # Shape: [batch_size, 1]
-                            rewards_t = torch.tensor(rewards_b, dtype=torch.float32, device=self.device).unsqueeze(1) # Shape: [batch_size, 1]
+                            actions_t = torch.tensor(actions_b, dtype=torch.long, device=self.device).unsqueeze(1)
+                            rewards_t = torch.tensor(rewards_b, dtype=torch.float32, device=self.device).unsqueeze(1)
                             next_states_t = torch.tensor(next_states_b, dtype=torch.float32, device=self.device)
-                            dones_t = torch.tensor(dones_b, dtype=torch.float32, device=self.device).unsqueeze(1) # Shape: [batch_size, 1]
+                            dones_t = torch.tensor(dones_b, dtype=torch.float32, device=self.device).unsqueeze(1)
 
-                            # --- Calculate Target Q-values (Double DQN) ---
                             with torch.no_grad():
-                                # 1. Get the action selected by the *current* agent network for the next states
-                                best_next_actions = agent(next_states_t).argmax(dim=1, keepdim=True) # Shape: [batch_size, 1]
-                                # 2. Get the Q-value of those actions from the *target* network
+                                best_next_actions = agent(next_states_t).argmax(dim=1, keepdim=True)
                                 next_q_values_target = target_net(next_states_t).gather(1, best_next_actions)
-                                # 3. Calculate the TD target
-                                target_q_values = rewards_t + self.gamma * next_q_values_target * (1 - dones_t) # dones_t is 1 if terminal
+                                target_q_values = rewards_t + self.gamma * next_q_values_target * (1 - dones_t)
 
-                            # --- Calculate Current Q-values ---
-                            # Get the Q-values for the actions actually taken
                             current_q_values = agent(states_t).gather(1, actions_t)
-
-                            # --- Calculate Loss ---
                             loss = nn.MSELoss()(current_q_values, target_q_values)
-                            loss_history.append(loss.item()) # Track loss
+                            loss_history.append(loss.item())
 
-                            # --- Backpropagation ---
                             optimizer.zero_grad()
                             loss.backward()
-                            # Optional: Gradient clipping
-                            # torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
                             optimizer.step()
 
-                            # --- Target Network Update ---
                             if global_step % self.target_update_freq == 0:
                                 target_net.load_state_dict(agent.state_dict())
 
                         # --- Update State and Stats for Agent's Step ---
-                        state = next_state # Move to the next state
+                        state = next_state
                         tournament_agent_steps += 1
-                        global_step += 1 # Increment global step counter *only* after an agent step/update
+                        global_step += 1
 
                     # --- Opponent's Turn ---
                     else:
-                        # Let the environment handle the opponent's turn.
-                        # Call step with a placeholder action (-1)
-                        # Env should internally use the opponent's policy function.
-                        # Env step MUST return the *next state* for the *agent* (player 0)
-                        # and reward=0 (as no agent action occurred).
                         next_state_after_opponents, step_reward, terminated, truncated, info = self.env.step(-1)
-
-                        # Update the agent's state variable for its *next* turn
                         state = next_state_after_opponents
-                        # Accumulate any reward assigned to the agent during opponent turns (should be 0)
                         episode_reward_cumulative += step_reward
 
-                        # Note: We do not store opponent transitions in the agent's buffer
-                        # Note: We do not increment global_step here, only on agent steps
+                    # --- Check for round end and store round reward ---
+                    if info.get('round_over', False):
+                        num_rounds_in_episode += 1
+                        round_reward = info.get('round_reward', 0.0)
+                        episode_round_rewards.append(round_reward)
 
-                    tournament_total_steps += 1 # Increment total steps (agent + opponent processing)
+                    tournament_total_steps += 1
 
                 except Exception as e:
                     print(f"ERROR during step processing in Tournament {episode}, Total Step {tournament_total_steps}, Current Player {current_player}: {e}")
                     import traceback
-                    traceback.print_exc() # Print detailed traceback
-                    terminated = True # Terminate the episode on error
+                    traceback.print_exc()
+                    terminated = True
                     break # Exit the inner while loop
 
             # --- End of Tournament (Episode) ---
             episode_end_time = time.time()
             episode_duration = episode_end_time - episode_start_time
 
-            episode_rewards_deque.append(episode_reward_cumulative) # Add final cumulative reward for the episode
-            avg_reward = float(np.mean(episode_rewards_deque)) # Calculate rolling average
-            current_epsilon = epsilon_by_frame(global_step) # Epsilon at the end of episode
+            # *** ADDED: Check for long duration and skip/update opponents ***
+            if episode_duration > MAX_EPISODE_DURATION_SEC:
+                print(f"WARNING: Episode {episode} duration ({episode_duration:.2f}s) exceeded threshold ({MAX_EPISODE_DURATION_SEC:.1f}s).")
+                print("         Forcing opponent update and skipping metrics/checkpoint save for this episode.")
+                # Trigger opponent update immediately
+                self._trigger_opponent_update(episode, opponent_ids, agent_action_list)
+                # Skip the rest of the loop iteration (logging, saving)
+                continue # Go to the next episode
+
+            # --- Regular End-of-Episode Processing (if duration check passed) ---
+
+            avg_round_reward = float(np.mean(episode_round_rewards)) if episode_round_rewards else 0.0
+            episode_rewards_deque.append(episode_reward_cumulative)
+            avg_reward = float(np.mean(episode_rewards_deque))
+            current_epsilon = epsilon_by_frame(global_step)
             avg_loss = float(np.mean(loss_history)) if loss_history else 0.0
 
             metrics_list.append({
                 'episode': episode,
-                'reward': episode_reward_cumulative, # Total reward for the episode
+                'reward': episode_reward_cumulative,
                 'avg_reward': avg_reward,
-                'agent_steps': tournament_agent_steps, # Steps taken by agent
-                'total_steps': tournament_total_steps, # Total steps processed in env
+                'agent_steps': tournament_agent_steps,
+                'total_steps': tournament_total_steps,
                 'epsilon': current_epsilon,
                 'avg_loss': avg_loss,
-                'duration_sec': episode_duration
+                'duration_sec': episode_duration,
+                'num_rounds': num_rounds_in_episode,
+                'avg_round_reward': avg_round_reward
             })
 
             # --- Logging ---
-            if episode % 10 == 0 or episode == self.num_episodes: # Log every 10 episodes
+            if episode % 10 == 0 or episode == self.num_episodes:
                 print(f"T: {episode}, AgSteps: {tournament_agent_steps}, TotSteps: {tournament_total_steps}, "
-                      f"Reward: {episode_reward_cumulative:.2f}, Avg(100): {avg_reward:.2f}, "
+                      f"Rounds: {num_rounds_in_episode}, AvgRndRew: {avg_round_reward:.2f}, "
+                      f"EpReward: {episode_reward_cumulative:.2f}, AvgEpRew(100): {avg_reward:.2f}, "
                       f"AvgLoss(100): {avg_loss:.4f}, Eps: {current_epsilon:.4f}, "
                       f"GStep: {global_step}, Dur: {episode_duration:.1f}s")
 
@@ -528,7 +552,7 @@ class Train:
                     'optimizer_state_dict': optimizer.state_dict(),
                     'episode': episode,
                     'global_step': global_step,
-                    'current_update_index': self.current_update_index # Save opponent update index
+                    'current_update_index': self.current_update_index
                 }
                 path = os.path.join(self.checkpoint_dir, f'checkpoint_{episode}.pt')
                 try:
@@ -543,49 +567,24 @@ class Train:
                 is_new_file = not os.path.exists(metrics_file)
                 try:
                     with open(metrics_file, "a", newline="") as csvfile:
-                        # Define fieldnames based on the keys in metrics_list dictionaries
-                        fieldnames = ['episode', 'reward', 'avg_reward', 'agent_steps', 'total_steps', 'epsilon', 'avg_loss', 'duration_sec']
+                        fieldnames = [
+                            'episode', 'reward', 'avg_reward', 'agent_steps',
+                            'total_steps', 'epsilon', 'avg_loss', 'duration_sec',
+                            'num_rounds', 'avg_round_reward'
+                        ]
                         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                         if is_new_file or os.path.getsize(metrics_file) == 0:
-                            writer.writeheader() # Write header only if file is new or empty
-                        writer.writerows(metrics_list) # Write the accumulated metrics
-                    metrics_list.clear() # Clear list after saving
+                            writer.writeheader()
+                        writer.writerows(metrics_list)
+                    metrics_list.clear()
                 except Exception as e:
                     print(f"ERROR saving metrics to {metrics_file}: {e}")
 
-            # --- Update Opponent Policy ---
-            if episode > start_episode and episode % self.opponent_update_freq == 0 and len(opponent_ids) > 0:
-                # Choose an opponent seat to update (round-robin)
-                seat_to_update = opponent_ids[self.current_update_index % len(opponent_ids)]
-                print(f"\n--- Updating opponent policy at seat {seat_to_update} (Episode {episode}) ---")
+            # --- Regular Opponent Policy Update ---
+            # *** MODIFIED: Use the helper method ***
+            if episode > start_episode and episode % self.opponent_update_freq == 0:
+                self._trigger_opponent_update(episode, opponent_ids, agent_action_list)
 
-                # Find available checkpoints
-                chk_files = [
-                    f for f in os.listdir(self.checkpoint_dir)
-                    if f.startswith("checkpoint_") and f.endswith(".pt")
-                ]
-
-                if chk_files:
-                    # Option: Choose the latest checkpoint
-                    try:
-                        chk_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]), reverse=True)
-                        chosen_chk_file = chk_files[0]
-                    except: # Fallback to alphabetic sort if number parsing fails
-                         chk_files.sort(reverse=True)
-                         chosen_chk_file = chk_files[0] if chk_files else None
-
-                    if chosen_chk_file:
-                        full_path = os.path.join(self.checkpoint_dir, chosen_chk_file)
-                        self.update_one_opponent_from_checkpoint(
-                            seat_to_update, full_path, agent_action_list
-                        )
-                    else:
-                         print("No suitable checkpoint found; skipped opponent rotation.")
-
-                else:
-                    print("No checkpoints found; skipped opponent rotation.")
-
-                self.current_update_index += 1 # Move to the next opponent for the next update
 
         # --- End of Training ---
         print("\n--- Training Loop Finished ---")
@@ -594,11 +593,11 @@ class Train:
         final_path = os.path.join(self.checkpoint_dir, "final_agent_model.pt")
         final_dict = {
             'agent_state_dict': agent.state_dict(),
-            'target_net_state_dict': target_net.state_dict(), # Save final target net too
-            'optimizer_state_dict': optimizer.state_dict(), # Save final optimizer state
+            'target_net_state_dict': target_net.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
             'episode': self.num_episodes,
             'global_step': global_step,
-            'action_list': agent_action_list, # Include action list for inference later
+            'action_list': agent_action_list,
             'current_update_index': self.current_update_index
         }
         try:
@@ -612,9 +611,12 @@ class Train:
             metrics_file = os.path.join(self.checkpoint_dir, "training_metrics.csv")
             try:
                 with open(metrics_file, "a", newline="") as csvfile:
-                     fieldnames = ['episode', 'reward', 'avg_reward', 'agent_steps', 'total_steps', 'epsilon', 'avg_loss', 'duration_sec']
+                     fieldnames = [
+                         'episode', 'reward', 'avg_reward', 'agent_steps',
+                         'total_steps', 'epsilon', 'avg_loss', 'duration_sec',
+                         'num_rounds', 'avg_round_reward'
+                     ]
                      writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                     # Check if header needs writing (e.g., if file didn't exist or was empty)
                      if not os.path.exists(metrics_file) or os.path.getsize(metrics_file) == 0:
                           writer.writeheader()
                      writer.writerows(metrics_list)
@@ -638,11 +640,11 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for Adam optimizer.")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for DQN updates.")
     parser.add_argument("--buffer_size", type=int, default=10000, help="Replay buffer capacity.")
-    parser.add_argument("--target_update", type=int, default=500, help="Frequency (in agent steps) to update target network.")
-    parser.add_argument("--opponent_update", type=int, default=500, help="Frequency (in episodes) to update one opponent model.")
+    parser.add_argument("--target_update", type=int, default=50, help="Frequency (in agent steps) to update target network.")
+    parser.add_argument("--opponent_update", type=int, default=15, help="Frequency (in episodes) to update one opponent model.")
     parser.add_argument("--save_freq", type=int, default=200, help="Frequency (in episodes) to save checkpoints.")
     parser.add_argument("--metrics_freq", type=int, default=10, help="Frequency (in episodes) to save metrics.")
-    parser.add_argument("--max_steps", type=int, default=10000, help="Max steps per tournament episode before truncation.")
+    parser.add_argument("--max_steps", type=int, default=500, help="Max steps per tournament episode before truncation.")
 
 
     args = parser.parse_args()
